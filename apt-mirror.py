@@ -22,9 +22,13 @@ is line-oriented:
 ``#`` comment lines and blank lines are ignored.
 """
 
+import argparse
 import base64
 import bz2
+import contextlib
 import email.utils
+import fcntl
+import filecmp
 import gzip
 import http.client
 import logging
@@ -34,13 +38,17 @@ import platform
 import posixpath
 import queue
 import re
+import shutil
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
+import zlib
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1651,3 +1659,695 @@ def parse_index(path: Path, tree_prefix: str) -> list[PackageRec]:
         elif "File" in block or "Files" in block:
             records.extend(_sources_records(block, tree_prefix))
     return records
+
+
+# ---------------------------------------------------------------------------
+# Skel-to-mirror copy, cleanup, locking, postmirror, and main (spec §5.8-5.11)
+# ---------------------------------------------------------------------------
+
+
+def _quoted_path(path: str) -> str:
+    """A path single-quoted for POSIX sh, with ``'`` escaped as ``'\\''``.
+
+    Ports the original's ``quoted_path`` so the generated cleanup script
+    survives any character in the mirror paths.
+    """
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def copy_file(from_p: Path, to_p: Path, unlink_repl: bool) -> None:
+    """Copy (preferring a hardlink) ``from_p`` to ``to_p`` (spec §5.8).
+
+    Skips entirely when ``from_p`` is missing (parents are not created);
+    creates the destination's parent directories; when the destination
+    already matches the source's ``(st_size, st_mtime_ns)``, skips (the
+    common unchanged case); when ``unlink_repl`` (the ``unlink`` config
+    option) is set and the destination's content differs, deletes it
+    first; hardlinks when possible and falls back to a copy for the
+    cross-device case; and finally restores the source's atime/mtime onto
+    the destination.  A failed copy is a warning, not a fatal error (like
+    the original ``copy_file``).
+    """
+    if not from_p.is_file():
+        return
+    to_p.parent.mkdir(parents=True, exist_ok=True)
+    from_stat = from_p.stat()
+    if to_p.is_file():
+        to_stat = to_p.stat()
+        if (from_stat.st_size, from_stat.st_mtime_ns) == (
+            to_stat.st_size,
+            to_stat.st_mtime_ns,
+        ):
+            return
+        if unlink_repl and not filecmp.cmp(str(from_p), str(to_p), shallow=False):
+            to_p.unlink(missing_ok=True)
+    try:
+        try:
+            os.link(from_p, to_p)
+        except OSError:
+            shutil.copy2(from_p, to_p)
+    except OSError as error:
+        logger.warning("apt-mirror: can't copy %s to %s: %s", from_p, to_p, error)
+        return
+    os.utime(to_p, ns=(from_stat.st_atime_ns, from_stat.st_mtime_ns))
+
+
+@dataclass
+class Unneeded:
+    """The files/directories the cleanup removes (spec §5.9).
+
+    ``files`` and ``dirs`` hold mirror-tree-relative POSIX paths (files in
+    walk order; directories bottom-up, so a parent is listed only once its
+    children are gone); ``nbytes`` totals the removed files' on-disk size
+    in 512-byte block units.
+    """
+
+    files: list[str]
+    dirs: list[str]
+    nbytes: int
+
+
+def collect_unneeded(
+    mirror_root: Path,
+    clean_dirs: list[str],
+    skipclean: set[str],
+    tilde: bool,
+    plus: bool,
+) -> Unneeded:
+    """Walk each clean directory and collect what the cleanup removes.
+
+    ``clean_dirs`` are mirror-root-relative trees (the config ``clean``
+    URIs, sanitised).  A file is needed when its tree-relative path, after
+    the ``_tilde``/``_plus`` normalisation (``~`` -> ``%7E``, ``+`` ->
+    ``%2B``), is in ``skipclean``; a directory is needed when it (or any
+    path under it) is needed — **symlinks are always considered live**, so
+    a directory containing only symlinks is kept.  Non-needed files are
+    listed for removal, a directory is listed only once every path under
+    it is removable (bottom-up), and removed-file sizes are summed in
+    512-byte block units (``st_blocks * 512``).  A missing or
+    non-directory (or symlinked) clean root is skipped silently.
+    """
+
+    def key(rel: str) -> str:
+        key = rel
+        if tilde:
+            key = key.replace("~", "%7E")
+        if plus:
+            key = key.replace("+", "%2B")
+        return key
+
+    files: list[str] = []
+    dirs: list[str] = []
+    nbytes = 0
+
+    def process_file(rel: str) -> bool:
+        nonlocal nbytes
+        if key(rel) in skipclean:
+            return True
+        files.append(sanitise_uri(rel, tilde=tilde, plus=plus))
+        with contextlib.suppress(OSError):
+            nbytes += (mirror_root / rel).stat().st_blocks * 512
+        return False
+
+    def process_directory(rel: str) -> bool:
+        if key(rel) in skipclean:
+            return True
+        needed = False
+        try:
+            entries = sorted(os.scandir(mirror_root / rel), key=lambda e: e.name)
+        except OSError as error:
+            raise AptMirrorError(f"apt-mirror: can't opendir {rel}") from error
+        for entry in entries:
+            sub = f"{rel}/{entry.name}"
+            if entry.is_symlink():
+                # Symlinks are always considered live (original
+                # process_symlink) and are never followed.
+                needed = True
+            elif entry.is_dir(follow_symlinks=False):
+                # Always recurse — the original's ``|=`` never
+                # short-circuits, so a needed sibling must not skip the
+                # walk of the remaining entries.
+                if process_directory(sub):
+                    needed = True
+            elif entry.is_file(follow_symlinks=False) and process_file(sub):
+                needed = True
+        if not needed:
+            dirs.append(rel)
+        return needed
+
+    for clean_dir in clean_dirs:
+        path = mirror_root / clean_dir
+        if path.is_dir() and not path.is_symlink():
+            process_directory(clean_dir)
+    return Unneeded(files=files, dirs=dirs, nbytes=nbytes)
+
+
+def write_cleanscript(
+    path: Path,
+    mirror_path: str,
+    files: list[str],
+    dirs: list[str],
+) -> None:
+    """Generate the POSIX sh cleanup script (spec §5.9, original 1107-1145).
+
+    Emits ``#!/bin/sh``, ``set -e``, ``cd '<mirror path>'``, one
+    ``rm -f '<file>'`` line per file with the original's ``[NN%]``/``.``
+    progress cadence — guarded: no percentage is ever emitted for an
+    empty list (the original's divide-by-zero fix, spec §7) and a
+    terminal ``[100%]`` marks the end of each non-empty section — then
+    ``rm -r`` guarded by ``test -d`` per directory.  The header's size
+    string is computed the way the original does it: from the on-disk
+    (512-byte-block) usage of the listed files under ``mirror_path``.
+    All paths are single-quoted with ``'`` escaped as ``'\\''`` (see
+    _quoted_path).  The script is finished with ``chmod +x``.
+    """
+    nbytes = 0
+    for name in files:
+        try:
+            nbytes += (Path(mirror_path) / name).stat().st_blocks * 512
+        except OSError:
+            continue
+    size_output = format_bytes(nbytes)
+
+    lines: list[str] = [
+        "#!/bin/sh",
+        "set -e",
+        "",
+        f"cd {_quoted_path(mirror_path)}",
+        "",
+        f"echo 'Removing {len(files)} unnecessary files [{size_output}]...'",
+    ]
+    total = len(files)
+    for i, name in enumerate(files):
+        lines.append(f"rm -f {_quoted_path(name)}")
+        if total:
+            if i % 500 == 0:
+                lines.append(f"echo -n '[{100 * i // total}%]'")
+            if i % 10 == 0:
+                lines.append("echo -n .")
+    if total:
+        lines.append("echo -n '[100%]'")
+    lines += ["echo 'done.'", "echo", ""]
+
+    total = len(dirs)
+    lines.append(f"echo 'Removing {total} unnecessary directories...'")
+    for i, name in enumerate(dirs):
+        quoted = _quoted_path(name)
+        lines.append(f"if test -d {quoted}; then rm -r {quoted}; fi")
+        if total:
+            if i % 50 == 0:
+                lines.append(f"echo -n '[{100 * i // total}%]'")
+            lines.append("echo -n .")
+    if total:
+        lines.append("echo -n '[100%]'")
+    lines += ["echo 'done.'", "echo"]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    mode = path.stat().st_mode
+    path.chmod(mode | 0o111)
+
+
+@contextmanager
+def locked(var_path: Path) -> Iterator[None]:
+    """Hold an exclusive non-blocking ``flock`` on
+    ``<var_path>/apt-mirror.lock`` (spec §5.2).
+
+    On acquisition failure raises AptMirrorError with the original's
+    exact message (the lock file is left in place); on success the lock
+    is released and the lock file removed on exit — so a stale
+    (holderless) lock file left by a crash is simply re-acquired and does
+    not survive the next clean exit.
+    """
+    lock_file = var_path / "apt-mirror.lock"
+    fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(fd)
+        raise AptMirrorError("apt-mirror is already running, exiting") from error
+    try:
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        lock_file.unlink(missing_ok=True)
+
+
+def run_postmirror(variables: dict[str, str]) -> None:
+    """Run the postmirror script with the cwd set to ``mirror_path``.
+
+    Prints the three fixed original messages; runs the script directly
+    when it is executable, otherwise via ``/bin/sh`` (spec §5.10 — the
+    original still chdirs to ``mirror_path`` and user scripts may rely on
+    it).  A non-zero child exit status (or an exec failure) is a warning
+    only and never changes the process exit code.
+    """
+    script = get_var(variables, "postmirror_script")
+    mirror_dir = Path(get_var(variables, "mirror_path"))
+    print("Running the Post Mirror script ...")
+    print(f"({script})\n")
+    command = [script] if os.access(script, os.X_OK) else ["/bin/sh", script]
+    return_code: int | None = None
+    try:
+        result = subprocess.run(command, cwd=mirror_dir)
+        return_code = result.returncode
+    except OSError as error:
+        logger.warning(
+            "apt-mirror: can't run postmirror script '%s': %s", script, error
+        )
+    if return_code is not None and return_code != 0:
+        logger.warning(
+            "apt-mirror: postmirror script exited with status %d", return_code
+        )
+    print(
+        "\nPost Mirror script has completed. "
+        "See above output for any possible errors.\n"
+    )
+
+
+#: The per-distribution release files requested in stage 1 (spec §5.5).
+_RELEASE_NAMES = ("InRelease", "Release", "Release.gpg")
+
+#: Index file extensions tried when opening a skel index, in the original's
+#: ``process_index`` order (``xz gz bz2 lzma``), the last entry being the
+#: uncompressed file itself (spec §5.7).
+_INDEX_EXTENSIONS = (".xz", ".gz", ".bz2", ".lzma", "")
+
+#: Compression/decoding errors that mark a skel index as corrupt and
+#: eligible for a one-shot re-fetch (spec §7.1 fix #4).
+_INDEX_PARSE_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,  # gzip/bz2/lzma surface read failures here
+    EOFError,
+    UnicodeDecodeError,
+    zlib.error,
+    lzma.LZMAError,
+)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run one full mirror pass (spec §5); return 0 on success.
+
+    ``argv`` defaults to ``sys.argv[1:]``.  ``--version`` prints
+    ``apt-mirror (python3) 1.0.0`` and returns 0.  Any AptMirrorError
+    (config, directory, or lock failure) is printed to stderr and yields
+    a 1; per-URL download failures are never fatal.
+    """
+    parser = argparse.ArgumentParser(
+        prog="apt-mirror.py",
+        description="Mirror apt repositories (Python reimplementation of "
+        "the Perl apt-mirror).",
+    )
+    parser.add_argument(
+        "configfile",
+        nargs="?",
+        default="/etc/apt/mirror.list",
+        help="mirror.list config file (default: /etc/apt/mirror.list)",
+    )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="print the version string and exit",
+    )
+    args = parser.parse_args(argv)
+    if args.version:
+        print("apt-mirror (python3) 1.0.0")
+        return 0
+    try:
+        return _mirror_run(args.configfile)
+    except AptMirrorError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+
+def _mirror_run(configfile: str) -> int:
+    """The full stage pipeline (spec §5): returns 0 on success.
+
+    Stage order (the original's): create the three directories -> lock ->
+    release -> index -> archive -> skel-to-mirror copy -> clean ->
+    postmirror.  AptMirrorError propagates to main's handler; per-URL
+    failures stay within their stage.
+    """
+    config = parse_config(configfile)
+    variables = config.variables
+    tilde = _config_on(get_var(variables, "_tilde"))
+    plus = _config_on(get_var(variables, "_plus"))
+    mirror_path = Path(get_var(variables, "mirror_path"))
+    skel_path = Path(get_var(variables, "skel_path"))
+    var_path = Path(get_var(variables, "var_path"))
+    cleanscript_path = Path(get_var(variables, "cleanscript"))
+    unlink_repl = _config_on(get_var(variables, "unlink"))
+
+    # The three needed directories (spec §5.2), created before anything
+    # else is touched.
+    for directory in (mirror_path, skel_path, var_path):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise AptMirrorError(
+                f"apt-mirror: can't create {directory} directory"
+            ) from error
+
+    fetcher = Fetcher(variables)
+    specs = config.binaries + config.sources
+
+    # Shared per-run state.  skipclean starts with the config skip-clean
+    # entries and gains every queued file (canonical **and** by-hash tree
+    # spelling) plus every archive record's tree path.
+    skipclean: set[str] = set(config.skipclean)
+    hashsum_to_canonical: dict[str, list[str]] = {}
+    canonical_to_hashsums: dict[str, list[str]] = {}
+    release_urls: list[str] = []
+    index_urls: list[str] = []
+    index_urls_seen: set[str] = set()
+
+    with locked(var_path):
+        # ----------------------- Stage 1: release (spec §5.5) ---------
+        def queue_release_urls() -> None:
+            """Queue InRelease/Release/Release.gpg for every spec,
+            registering each in skipclean (original add_url_to_download)."""
+            seen: set[str] = set()
+            for spec in specs:
+                for name in _RELEASE_NAMES:
+                    url = remove_double_slashes(dist_base(spec) + name)
+                    if url in seen:
+                        continue
+                    seen.add(url)
+                    release_urls.append(url)
+                    skipclean.add(sanitise_uri(url, tilde, plus))
+
+        queue_release_urls()
+        download_stage(
+            "release",
+            sorted(release_urls),
+            skel_path,
+            fetcher,
+            variables,
+            var_path,
+        )
+
+        # ------------------------ Stage 2: index (spec §5.6) ----------
+        def valid_release_info(path: Path) -> ReleaseInfo | None:
+            """The ReleaseInfo of a non-empty, parseable Release file, or
+            None when the copy is missing, empty, or unparseable (spec
+            §7.1 fix #4 — a truncated Release must not survive the
+            validity check)."""
+            if not path.is_file():
+                return None
+            try:
+                if path.stat().st_size == 0:
+                    return None
+                return parse_release(path)
+            except (OSError, UnicodeDecodeError, ValueError):
+                return None
+
+        def spec_release_info(spec: Repo) -> ReleaseInfo | None:
+            """The usable InRelease (else Release) of ``spec``.
+
+            A local copy that exists but is empty or fails parse_release
+            is deleted and re-fetched once.  When neither file yields a
+            parseable Release the exact original warning is printed (to
+            stderr) and None is returned so the caller falls back to the
+            well-known index set."""
+            for name in ("InRelease", "Release"):
+                url = dist_base(spec) + name
+                path = skel_path / sanitise_uri(url, tilde, plus)
+                info = valid_release_info(path)
+                if info is None and path.exists():
+                    path.unlink(missing_ok=True)
+                    with contextlib.suppress(FetchError):
+                        fetcher.fetch(url, path)
+                    info = valid_release_info(path)
+                if info is not None:
+                    return info
+            print(
+                "Failed to find InRelease or Release in "
+                f"{skel_path}/{sanitise_uri(dist_base(spec), tilde, plus)}",
+                file=sys.stderr,
+            )
+            return None
+
+        def queue_index_urls(spec: Repo) -> None:
+            """Queue ``spec``'s index files for the skel stage, registering
+            every queued file (canonical and by-hash tree paths) in
+            skipclean and populating the two by-hash maps (spec §5.6.4)."""
+            info = spec_release_info(spec)
+            if info is None:
+                indices = known_index_urls(spec)
+                # Fallback filenames are repo-URI-relative: no dist/
+                # prepending (controller clarification 1).
+                base_url = spec.uri
+            else:
+                indices = index_urls_for(spec, info)
+                # Release-driven filenames are dist-root-relative.
+                base_url = dist_base(spec)
+            for idx in indices:
+                url = remove_double_slashes(base_url + "/" + idx.by_hash_path)
+                canonical_tree = sanitise_uri(
+                    remove_double_slashes(base_url + "/" + idx.filename),
+                    tilde,
+                    plus,
+                )
+                skipclean.add(canonical_tree)
+                if idx.by_hash is not None and idx.by_hashsum is not None:
+                    hash_tree = sanitise_uri(url, tilde, plus)
+                    skipclean.add(hash_tree)
+                    hashsum_to_canonical.setdefault(hash_tree, []).append(
+                        canonical_tree
+                    )
+                    canonical_to_hashsums.setdefault(canonical_tree, []).append(
+                        hash_tree
+                    )
+                if url not in index_urls_seen:
+                    index_urls_seen.add(url)
+                    index_urls.append(url)
+
+        marks: list[str] = []
+        for spec in specs:
+            # One M per config entry, in the original's output order
+            # (binaries first, then sources).
+            marks.append("M")
+            queue_index_urls(spec)
+        print(f"Processing metadata files from releases [{''.join(marks)}]")
+        print()
+        download_stage(
+            "index", sorted(index_urls), skel_path, fetcher, variables, var_path
+        )
+
+        # By-hash index files were stored under their by-hash path; the
+        # original fans them out to their canonical skel paths right after
+        # the stage (download_urls, original 339-348 — the cwd is the skel
+        # there), so the archive stage can open the canonical index files.
+        for hash_tree, canonicals in hashsum_to_canonical.items():
+            for canonical in canonicals:
+                copy_file(skel_path / hash_tree, skel_path / canonical, unlink_repl)
+
+        # ----------------------- Stage 3: archive (spec §5.7) ---------
+        all_lines: list[str] = []
+        new_lines: list[str] = []
+        md5_lines: list[str] = []
+        sha1_lines: list[str] = []
+        sha256_lines: list[str] = []
+        archive_urls: dict[str, int] = {}
+
+        def read_index(spec: Repo, path: Path, url: str, tree_prefix: str):
+            """Parse one skel index file, deleting and re-fetching a
+            corrupt copy once (spec §7.1 fix #4).  A malformed Sources
+            format is a hard error (original die); every other parse
+            failure is a warning (the index is treated as absent)."""
+            try:
+                return parse_index(path, tree_prefix)
+            except AptMirrorError:
+                raise
+            except _INDEX_PARSE_ERRORS:
+                path.unlink(missing_ok=True)
+                try:
+                    fetcher.fetch(url, path)
+                except FetchError:
+                    logger.warning(
+                        "apt-mirror: can't open index %s in process_index", path
+                    )
+                    return []
+                try:
+                    return parse_index(path, tree_prefix)
+                except AptMirrorError:
+                    raise
+                except _INDEX_PARSE_ERRORS:
+                    logger.warning(
+                        "apt-mirror: can't open index %s in process_index", path
+                    )
+                    return []
+
+        def process_index_spec(spec: Repo, index_rel: str, optional: bool) -> None:
+            """The original's process_index: open ``spec``'s skel index at
+            ``index_rel`` (trying each compressed extension, then the
+            uncompressed file) and do the ALL/NEW/MD5/SHA1/SHA256
+            bookkeeping plus the archive URL queue for every record."""
+            tree_prefix = sanitise_uri(spec.uri, tilde, plus)
+            skel_base = skel_path / tree_prefix
+            for extension in _INDEX_EXTENSIONS:
+                rel = f"{index_rel}{extension}"
+                path = skel_base / rel
+                if not path.is_file():
+                    continue
+                for rec in read_index(spec, path, f"{spec.uri}/{rel}", tree_prefix):
+                    # One source of truth per record: every bookkeeping
+                    # list and the skipclean set see the very same
+                    # PackageRec.
+                    skipclean.add(rec.mirror_rel)
+                    all_lines.append(rec.mirror_rel)
+                    if rec.md5 is not None:
+                        md5_lines.append(f"{rec.md5}  {rec.mirror_rel}")
+                    if rec.sha1 is not None:
+                        sha1_lines.append(f"{rec.sha1}  {rec.mirror_rel}")
+                    if rec.sha256 is not None:
+                        sha256_lines.append(f"{rec.sha256}  {rec.mirror_rel}")
+                    if need_update(mirror_path / rec.mirror_rel, rec.size):
+                        # The original prints the full URL to NEW and
+                        # queues the very same remove_double_slashes'd URL
+                        # for the archive download.
+                        download_url = remove_double_slashes(
+                            f"{spec.uri}/{rec.url_rel}"
+                        )
+                        new_lines.append(download_url)
+                        archive_urls[download_url] = rec.size
+                return
+            if not optional:
+                logger.warning(
+                    "apt-mirror: can't open index %s/%s in process_index",
+                    tree_prefix,
+                    index_rel,
+                )
+
+        marks = []
+        for spec in config.sources:
+            # One S per source spec.
+            marks.append("S")
+            if spec.components is not None:
+                for comp in spec.components:
+                    process_index_spec(
+                        spec,
+                        f"dists/{spec.distribution}/{comp}/source/Sources",
+                        False,
+                    )
+            else:
+                process_index_spec(spec, f"{spec.distribution}/Sources", False)
+        for spec in config.binaries:
+            # One P per binary spec.
+            marks.append("P")
+            if spec.components is not None:
+                for comp in spec.components:
+                    d = spec.distribution
+                    process_index_spec(
+                        spec,
+                        f"dists/{d}/{comp}/binary-{spec.arch}/Packages",
+                        False,
+                    )
+                    process_index_spec(
+                        spec, f"dists/{d}/{comp}/binary-all/Packages", True
+                    )
+                    process_index_spec(
+                        spec,
+                        f"dists/{d}/{comp}/debian-installer/"
+                        f"binary-{spec.arch}/Packages",
+                        True,
+                    )
+                    process_index_spec(
+                        spec,
+                        f"dists/{d}/{comp}/debian-installer/binary-all/Packages",
+                        True,
+                    )
+            else:
+                process_index_spec(spec, f"{spec.distribution}/Packages", False)
+        print(f"Processing indexes: [{''.join(marks)}]")
+        print()
+
+        # The five intermediate files, truncated fresh at the start of the
+        # stage (the original opens them before any record is read); an
+        # empty stage still leaves them in place.
+        for name, lines in (
+            ("ALL", all_lines),
+            ("NEW", new_lines),
+            ("MD5", md5_lines),
+            ("SHA1", sha1_lines),
+            ("SHA256", sha256_lines),
+        ):
+            (var_path / name).write_text(
+                "".join(f"{line}\n" for line in lines), encoding="utf-8"
+            )
+
+        need_bytes = sum(archive_urls.values())
+        print(f"{format_bytes(need_bytes)} will be downloaded into archive.")
+        download_stage(
+            "archive",
+            sorted(archive_urls),
+            mirror_path,
+            fetcher,
+            variables,
+            var_path,
+        )
+
+        # --------------------- Skel -> mirror copy (spec §5.8) --------
+        for url in release_urls + index_urls:
+            sanitized = sanitise_uri(url, tilde, plus)
+            copy_file(skel_path / sanitized, mirror_path / sanitized, unlink_repl)
+            # A by-hash download fans out to its canonical path, and (as
+            # the original does) to every other by-hash path mapped to
+            # that canonical file.
+            for canonical in hashsum_to_canonical.get(sanitized, []):
+                copy_file(
+                    mirror_path / sanitized,
+                    mirror_path / canonical,
+                    unlink_repl,
+                )
+                for other_hash in canonical_to_hashsums.get(canonical, []):
+                    copy_file(
+                        mirror_path / sanitized,
+                        mirror_path / other_hash,
+                        unlink_repl,
+                    )
+
+        # --------------------------- Cleaning (spec §5.9) -------------
+        unneeded = collect_unneeded(
+            mirror_path, sorted(config.clean), skipclean, tilde, plus
+        )
+        # The original opens (truncates) the cleanscript regardless of
+        # mode; in _autoclean mode it stays empty.
+        try:
+            cleanscript_path.parent.mkdir(parents=True, exist_ok=True)
+            cleanscript_path.touch()
+        except OSError:
+            pass
+        if _config_on(get_var(variables, "_autoclean")):
+            print(
+                f"{format_bytes(unneeded.nbytes)} in "
+                f"{len(unneeded.files)} files and {len(unneeded.dirs)} "
+                f"directories will be freed...",
+                end="",
+            )
+            for name in unneeded.files:
+                (mirror_path / name).unlink(missing_ok=True)
+            for name in unneeded.dirs:
+                with contextlib.suppress(OSError):
+                    (mirror_path / name).rmdir()
+        else:
+            print(
+                f"{format_bytes(unneeded.nbytes)} in "
+                f"{len(unneeded.files)} files and {len(unneeded.dirs)} "
+                f"directories can be freed.\n"
+            )
+            print(f"Run {cleanscript_path} for this purpose.\n")
+            write_cleanscript(
+                cleanscript_path, str(mirror_path), unneeded.files, unneeded.dirs
+            )
+
+        # ------------------------- Postmirror (spec §5.10) ------------
+        if _config_on(get_var(variables, "run_postmirror")):
+            script_path = Path(get_var(variables, "postmirror_script"))
+            if script_path.is_file():
+                run_postmirror(variables)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
