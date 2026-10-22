@@ -22,11 +22,21 @@ is line-oriented:
 ``#`` comment lines and blank lines are ignored.
 """
 
+import base64
+import email.utils
+import http.client
+import logging
+import os
 import platform
 import re
+import ssl
 import subprocess
+import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger("apt-mirror")
 
 #: Maximum number of $name expansion passes before a value is declared
 #: non-converging (a substitution loop).
@@ -297,6 +307,413 @@ def parse_rate(value: str) -> float:
     if not suffix:
         return number
     return number * _RATE_MULTIPLIERS[suffix]
+
+
+# ---------------------------------------------------------------------------
+# HTTP(S) fetch layer (spec §5.3)
+# ---------------------------------------------------------------------------
+
+#: Response bodies are read (and paced) in chunks this large.
+_CHUNK_SIZE = 256 * 1024
+
+#: Total per-URL attempts (1 initial + 4 retries) on transient failures.
+_MAX_ATTEMPTS = 5
+
+#: Socket timeout, in seconds, applied to every connection.
+_SOCKET_TIMEOUT = 30.0
+
+_USERINFO_RE = re.compile(r"(?<=://)[^@/]*@")
+
+
+def _strip_userinfo(url: str) -> str:
+    """Remove a ``user[:password]@`` prefix from a URL, if present."""
+    return _USERINFO_RE.sub("", url, count=1)
+
+
+def _config_on(value: str | None) -> bool:
+    """Return True for a config value that switches an option on.
+
+    "1", "on", "yes", "true" (case-insensitive, surrounding whitespace
+    ignored) are on; everything else — including "", "0", "off" and None —
+    is off.
+    """
+    if value is None:
+        return False
+    return value.strip().lower() in ("1", "on", "yes", "true")
+
+
+class FetchError(Exception):
+    """A single URL could not be fetched; the run may continue without it.
+
+    ``url`` and ``reason`` are both credential-free and safe to print,
+    log, or persist; ``str(e)`` is a single-line user-facing message with
+    the ``apt-mirror:`` prefix.
+    """
+
+    def __init__(self, url: str, reason: str) -> None:
+        super().__init__(f"apt-mirror: {url}: {reason}")
+        self.url = url
+        self.reason = reason
+
+
+class FetchNotFound(FetchError):
+    """The server answered 404 for the URL (raised without retry)."""
+
+
+class _TruncatedBodyError(http.client.HTTPException):
+    """A Content-Length-bound response ended before the declared length.
+
+    Sizing reads (``read(n)``) return EOF silently, so a connection that
+    dies mid-body only shows up as a short byte count; this turns that
+    into a retryable transport error.
+    """
+
+
+class RateLimiter:
+    """Pace a byte stream so its running average stays at or below a ceiling.
+
+    Call :meth:`pace` once per chunk just written; the limiter sleeps until
+    every byte paced since the first call has had its share of
+    ``rate_bps``.  Natural delays (server latency, scheduling) credit
+    against the budget, so a rate at or above the wire speed costs
+    effectively zero overhead; a non-positive rate disables pacing.
+    """
+
+    def __init__(self, rate_bps: float) -> None:
+        self._rate_bps = float(rate_bps)
+        self._deadline = 0.0  # monotonic time the next byte may be sent by
+
+    def pace(self, n_bytes: int) -> None:
+        """Sleep until ``n_bytes`` more bytes fit within the running rate."""
+        if n_bytes <= 0 or self._rate_bps <= 0:
+            return
+        self._deadline = (
+            max(self._deadline, time.monotonic()) + n_bytes / self._rate_bps
+        )
+        wait = self._deadline - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+
+
+class Fetcher:
+    """Download files over HTTP(S) with atomic writes, resume, and retries.
+
+    Built from the spec §5.1 config ``variables``: ``limit_rate`` (an
+    invalid value raises AptMirrorError via parse_rate) drives a
+    per-Fetcher RateLimiter; ``no_check_certificate``, ``ca_certificate``,
+    ``certificate`` and ``private_key`` shape the TLS context; ``use_proxy``
+    with ``http_proxy`` / ``https_proxy`` / ``proxy_user`` /
+    ``proxy_password`` routes transfers through a proxy; and
+    ``auth_no_challenge`` controls origin Basic authentication.
+    """
+
+    def __init__(self, variables: dict[str, str], backoff_base: float = 1.0) -> None:
+        """Prepare the rate limiter, TLS context, and proxy table.
+
+        ``backoff_base`` scales the retry backoff schedule (base, 2x, 4x,
+        8x seconds between the up-to-5 attempts) and exists so tests can
+        keep it fast.
+        """
+        self._backoff_base = backoff_base
+        self._limiter = RateLimiter(
+            parse_rate(variables.get("limit_rate", DEFAULT_CONFIG["limit_rate"]))
+        )
+        self._auth_no_challenge = _config_on(variables.get("auth_no_challenge") or "0")
+        self._tls_context = self._build_tls_context(variables)
+        self._proxies = self._build_proxy_table(variables)
+
+    @staticmethod
+    def _build_tls_context(variables: dict[str, str]) -> ssl.SSLContext:
+        """Build the TLS context for https URLs (spec §5.1).
+
+        ``no_check_certificate`` disables verification entirely (documented
+        as insecure); ``ca_certificate`` replaces the default trust store;
+        ``certificate`` plus ``private_key`` add a client certificate.  A
+        missing or unreadable file raises AptMirrorError.
+        """
+        if _config_on(variables.get("no_check_certificate") or "0"):
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        else:
+            context = ssl.create_default_context()
+            ca_certificate = (variables.get("ca_certificate") or "").strip()
+            if ca_certificate:
+                try:
+                    context.load_verify_locations(ca_certificate)
+                except (OSError, ssl.SSLError) as error:
+                    raise AptMirrorError(
+                        f"apt-mirror: invalid ca_certificate "
+                        f"'{ca_certificate}': {error}"
+                    ) from error
+        certificate = (variables.get("certificate") or "").strip()
+        private_key = (variables.get("private_key") or "").strip()
+        if certificate and private_key:
+            try:
+                context.load_cert_chain(certificate, private_key)
+            except (OSError, ssl.SSLError) as error:
+                raise AptMirrorError(
+                    f"apt-mirror: invalid certificate/private_key pair: {error}"
+                ) from error
+        return context
+
+    @staticmethod
+    def _build_proxy_table(
+        variables: dict[str, str],
+    ) -> dict[str, tuple[str, int, bytes | None]]:
+        """Build the per-scheme proxy table, only when use_proxy is on.
+
+        Maps a target scheme to (proxy host, proxy port, an optional
+        Proxy-Authorization header).  The proxy URL is always dialed in
+        the clear (https targets are CONNECT-tunnelled through it).
+        Userinfo embedded in the proxy URL wins over the separate
+        proxy_user / proxy_password variables.  An invalid proxy URL is an
+        AptMirrorError that does not echo the URL (it may carry secrets).
+        """
+        proxies: dict[str, tuple[str, int, bytes | None]] = {}
+        if not _config_on(variables.get("use_proxy") or "off"):
+            return proxies
+        for key, target_scheme in (("http_proxy", "http"), ("https_proxy", "https")):
+            raw = (variables.get(key) or "").strip()
+            if not raw:
+                continue
+            try:
+                proxy = urllib.parse.urlsplit(raw)
+                if proxy.scheme not in ("http", "https") or not proxy.hostname:
+                    raise ValueError("missing host")
+            except ValueError:
+                raise AptMirrorError(
+                    f"apt-mirror: invalid proxy URL for '{key}'"
+                ) from None
+            username = proxy.username
+            password = proxy.password
+            if username is None:
+                username = (variables.get("proxy_user") or "").strip()
+                password = (variables.get("proxy_password") or "").strip()
+            auth: bytes | None = None
+            if username:
+                token = base64.b64encode(f"{username}:{password}".encode())
+                auth = b"Basic " + token
+            proxies[target_scheme] = (proxy.hostname, proxy.port or 80, auth)
+        return proxies
+
+    def _connect(
+        self,
+        scheme: str,
+        host: str,
+        port: int,
+        netloc: str,
+        target: str,
+        headers: dict[str, str],
+    ) -> tuple[http.client.HTTPConnection, str]:
+        """Open a connection to the target, honouring the proxy table.
+
+        Returns the ready connection plus the request URL to send (an
+        absolute-form URL for plain http through a proxy, the path target
+        otherwise).  A proxy credential is added to ``headers``
+        (Proxy-Authorization for plain http, CONNECT for tunnelled https).
+        """
+        proxy = self._proxies.get(scheme)
+        if proxy is None:
+            if scheme == "https":
+                conn = http.client.HTTPSConnection(
+                    host, port, timeout=_SOCKET_TIMEOUT, context=self._tls_context
+                )
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=_SOCKET_TIMEOUT)
+            return conn, target
+        proxy_host, proxy_port, proxy_auth = proxy
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(
+                proxy_host,
+                proxy_port,
+                timeout=_SOCKET_TIMEOUT,
+                context=self._tls_context,
+            )
+            conn.set_tunnel(host, port, proxy_authorization=proxy_auth or b"")
+            return conn, target
+        conn = http.client.HTTPConnection(
+            proxy_host, proxy_port, timeout=_SOCKET_TIMEOUT
+        )
+        if proxy_auth:
+            headers["Proxy-Authorization"] = proxy_auth.decode("ascii")
+        # Plain http through a proxy needs the absolute-form request target.
+        return conn, f"http://{netloc}{target}"
+
+    @staticmethod
+    def _range_start(response: http.client.HTTPResponse) -> int | None:
+        """Return the first offset of a 206 Content-Range, or None if absent."""
+        match = re.match(r"bytes (\d+)-", response.getheader("Content-Range") or "")
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _require_complete(written: int, expected: int | None) -> None:
+        """Raise a retryable error when a promised body arrived short.
+
+        ``expected`` is the Content-Length captured before reading (None
+        for chunked/unknown bodies, which have no promise to check).
+        """
+        if expected is not None and written != expected:
+            raise _TruncatedBodyError(f"received {written} of {expected} bytes")
+
+    def _write_body(
+        self, response: http.client.HTTPResponse, part: Path, mode: str
+    ) -> int:
+        """Stream the response into ``part``, pacing each chunk to the rate.
+
+        Returns the bytes written this call.  On a truncated body the HTTP
+        exception propagates to the caller's retry logic while the partial
+        data already written stays in ``part`` for the next resume attempt.
+        """
+        total = 0
+        try:
+            with open(part, mode) as handle:
+                while chunk := response.read(_CHUNK_SIZE):
+                    self._limiter.pace(len(chunk))
+                    handle.write(chunk)
+                    total += len(chunk)
+        finally:
+            response.close()
+        return total
+
+    def fetch(self, url: str, dest: Path) -> int:
+        """Download ``url`` to ``dest`` atomically; return bytes written.
+
+        The return value counts the bytes written to ``dest`` on *this*
+        call: 0 when the server answered 304 (file untouched), the full
+        size for a fresh 200 download, and only the appended portion when
+        a partial ``<dest>.part`` is resumed via Range/206.
+
+        Semantics (spec §5.3): only http/https — anything else raises
+        AptMirrorError before any connection is opened.  Userinfo in the
+        URL is stripped and sent as ``Authorization: Basic`` — always when
+        ``auth_no_challenge`` is on, otherwise only after an initial 401
+        challenge (one immediate, undelayed retry) — and never appears in
+        any error, log line, or file.  An existing ``dest`` triggers
+        ``If-Modified-Since`` (304 -> 0); an existing ``<dest>.part``
+        triggers ``Range: bytes=N-`` resume (206 appends, 200 restarts);
+        on success the part is ``os.replace``d onto ``dest``.  Connection
+        errors, timeouts, 429, and 5xx raise FetchError after up to
+        _MAX_ATTEMPTS attempts with exponential backoff; 404 raises
+        FetchNotFound and any other 4xx raises FetchError immediately.
+        """
+        try:
+            parsed = urllib.parse.urlsplit(url)
+        except ValueError as error:
+            raise FetchError(_strip_userinfo(url), f"invalid URL: {error}") from error
+        scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https"):
+            raise AptMirrorError(
+                f"apt-mirror: unsupported scheme '{parsed.scheme}' in URL "
+                f"{_strip_userinfo(url)}: only http and https are supported"
+            )
+        host = parsed.hostname
+        if not host:
+            raise FetchError(_strip_userinfo(url), "URL has no host")
+        default_port = 443 if scheme == "https" else 80
+        port = parsed.port or default_port
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        netloc = host if port == default_port else f"{host}:{port}"
+        # Credential-free URL used in every FetchError attribute, message,
+        # and log line from here on.
+        clean_url = f"{scheme}://{netloc}{target}"
+        username = parsed.username
+        password = parsed.password or ""
+        auth_header = None
+        if username is not None:
+            token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+            auth_header = f"Basic {token}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part = Path(str(dest) + ".part")
+        sent_auth = auth_header is not None and self._auth_no_challenge
+        attempt = 0
+        reason = "no attempt made"
+        while True:
+            attempt += 1
+            conn: http.client.HTTPConnection | None = None
+            try:
+                headers: dict[str, str] = {"User-Agent": "apt-mirror (python3)"}
+                part_size = part.stat().st_size if part.exists() else 0
+                if part_size:
+                    headers["Range"] = f"bytes={part_size}-"
+                elif dest.exists():
+                    headers["If-Modified-Since"] = email.utils.formatdate(
+                        timeval=dest.stat().st_mtime, usegmt=True
+                    )
+                if sent_auth:
+                    headers["Authorization"] = auth_header
+                conn, request_url = self._connect(
+                    scheme, host, port, netloc, target, headers
+                )
+                conn.request("GET", request_url, headers=headers)
+                response = conn.getresponse()
+                status = response.status
+                if status == 304:
+                    response.close()
+                    # dest is current; a leftover partial is stale.
+                    if part.exists():
+                        part.unlink()
+                    return 0
+                if status == 200:
+                    expected = response.length
+                    written = self._write_body(response, part, "wb")
+                    self._require_complete(written, expected)
+                    os.replace(part, dest)
+                    return written
+                if status == 206:
+                    expected = response.length
+                    start = self._range_start(response)
+                    # A 206 that does not start where our partial ends is
+                    # unusable for appending — restart from scratch.
+                    mode = "ab" if start in (None, part_size) else "wb"
+                    written = self._write_body(response, part, mode)
+                    self._require_complete(written, expected)
+                    os.replace(part, dest)
+                    return written
+                if status == 401:
+                    response.close()
+                    if auth_header is not None and not sent_auth:
+                        # The server is challenging: retry once,
+                        # immediately, with the credential already at hand.
+                        # Not a failed attempt (no backoff).
+                        sent_auth = True
+                        attempt -= 1
+                        continue
+                    reason = "HTTP 401 (authentication failed)"
+                    logger.warning("%s: %s", clean_url, reason)
+                    raise FetchError(clean_url, reason)
+                response.close()
+                reason = f"HTTP {status}"
+                if status == 404:
+                    logger.warning("%s: %s", clean_url, reason)
+                    raise FetchNotFound(clean_url, reason)
+                if not (status == 429 or 500 <= status < 600):
+                    logger.warning("%s: %s; not retryable", clean_url, reason)
+                    raise FetchError(clean_url, reason)
+            except (OSError, http.client.HTTPException) as error:
+                reason = f"{type(error).__name__}: {error}"
+            finally:
+                if conn is not None:
+                    conn.close()
+            if attempt >= _MAX_ATTEMPTS:
+                logger.warning(
+                    "%s: %s (after %d attempts)", clean_url, reason, _MAX_ATTEMPTS
+                )
+                raise FetchError(
+                    clean_url, f"{reason} (after {_MAX_ATTEMPTS} attempts)"
+                )
+            delay = self._backoff_base * (2 ** (attempt - 1))
+            logger.warning(
+                "%s: %s (attempt %d of %d); retrying in %.3fs",
+                clean_url,
+                reason,
+                attempt,
+                _MAX_ATTEMPTS,
+                delay,
+            )
+            time.sleep(delay)
 
 
 def _arch_from_options(options: str) -> str | None:
