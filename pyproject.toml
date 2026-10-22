@@ -1,0 +1,13 @@
+[project]
+name = "apt-mirror-py3"
+version = "1.0.0"
+requires-python = ">=3.12"
+
+[project.optional-dependencies]
+test = ["pytest", "trustme"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
