@@ -1,7 +1,7 @@
 # Design: apt-mirror for Python 3
 
 **Date:** 2026-07-04
-**Status:** Draft (pending owner approval)
+**Status:** Approved by owner (2026-07-04)
 
 ## 1. Intent and why
 
