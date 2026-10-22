@@ -1,0 +1,29 @@
+set base_path         /var/spool/apt-mirror
+set mirror_path       $base_path/mirror
+set skel_path         $base_path/skel
+set var_path          $base_path/var
+set postmirror_script $var_path/postmirror.sh
+set defaultarch       amd64
+set run_postmirror    1
+set nthreads          4
+set limit_rate        1000m
+set _tilde            0
+# Use --unlink with wget (for use with hardlinked directories)
+set unlink            1
+set use_proxy         off
+#set http_proxy        127.0.0.1:3128
+#set proxy_user        user
+#set proxy_password    password
+set _autoclean        1
+
+deb [arch=amd64] http://us.archive.ubuntu.com/ubuntu noble main restricted universe multiverse
+deb [arch=amd64] http://us.archive.ubuntu.com/ubuntu noble-security main restricted universe multiverse
+deb [arch=amd64] http://us.archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
+deb [arch=amd64] http://us.archive.ubuntu.com/ubuntu noble-backports main restricted universe multiverse
+
+deb [arch=amd64]  http://ppa.launchpad.net/gluster/glusterfs-11/ubuntu noble main
+deb [arch=amd64] https://download.docker.com/linux/ubuntu noble stable
+
+clean http://us.archive.ubuntu.com/ubuntu
+clean http://download.docker.com/linux/ubuntu
+clean http://ppa.launchpad.net/gluster/glusterfs-11/ubuntu
