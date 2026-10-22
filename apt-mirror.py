@@ -184,25 +184,119 @@ def get_var(variables: dict[str, str], key: str) -> str:
     return _expand_template(variables[key], variables, f"while expanding '{key}'")
 
 
-def _sanitise_uri_now(raw: str, variables: dict[str, str]) -> str:
-    """Sanitise a clean/skip-clean URI into a mirror-tree directory key.
+# Path/URL normalisation for the mirror tree (spec §5.4).  Each ``_RDS_*``
+# pattern is applied, in order, to completion before the next one runs.
+_RDS_DOT = re.compile(r"/\./")  # ``/./`` -> ``/`` (redundant ``.`` component)
+_RDS_SLASH = re.compile(r"(?<!:)//")  # ``//`` -> ``/`` (never across ``://``)
+_RDS_DOTDOT = re.compile(r"(?<!:/)/[^/]+/\.\./")  # ``/seg/../`` -> ``/``
+_RDS_PATTERNS = (_RDS_DOT, _RDS_SLASH, _RDS_DOTDOT)
 
-    Task-1 internal: strips ``scheme://``, the userinfo part of the host
-    segment, and any trailing ``/``, applying the ``_tilde``/``_plus``
-    encodings when they are enabled in ``variables``.  Task 2 replaces
-    the call sites with the real ``sanitise_uri``; keep this name stable
-    until then.
+
+def sanitise_uri(url: str, tilde: bool = False, plus: bool = False) -> str:
+    """Turn a URL into a mirror-tree directory key.
+
+    Strips the ``scheme://`` prefix and, when the host segment carries an
+    ``@``, the leading ``userinfo@`` part; applies the ``_tilde`` / ``_plus``
+    percent-encodings (``~`` -> ``%7E``, ``+`` -> ``%2B``) when requested; and
+    removes a single trailing ``/``.  Ports the original Perl ``sanitise_uri``
+    with identical observable behaviour (spec §5.4).
     """
-    uri = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", raw)
-    host, slash, rest = uri.partition("/")
-    if "@" in host:
-        host = host.rpartition("@")[2]
-        uri = f"{host}/{rest}" if slash else host
-    if variables.get("_tilde", "0") not in ("", "0"):
+    uri = re.sub(r"^[A-Za-z0-9_]+://", "", url)
+    if "@" in uri.split("/", 1)[0]:
+        uri = re.sub(r"^[^@]*@", "", uri, count=1)
+    if tilde:
         uri = uri.replace("~", "%7E")
-    if variables.get("_plus", "0") not in ("", "0"):
+    if plus:
         uri = uri.replace("+", "%2B")
-    return uri.rstrip("/")
+    if uri.endswith("/"):
+        uri = uri[:-1]
+    return uri
+
+
+def remove_double_slashes(path: str, tilde: bool = False, plus: bool = False) -> str:
+    """Normalise a path inside the mirror tree.
+
+    Repeatedly collapses ``/./`` to ``/``, ``//`` to ``/`` (never across
+    ``://``), and ``/<segment>/../`` to ``/`` (never across ``:``), applying
+    the three rules in that fixed order and each to a fixpoint; then applies
+    the ``_tilde`` / ``_plus`` percent-encodings.  Ports the original Perl
+    ``remove_double_slashes`` with identical observable behaviour (spec §5.4).
+    """
+    result = path
+    for pattern in _RDS_PATTERNS:
+        result, changed = pattern.subn("/", result)
+        while changed:
+            result, changed = pattern.subn("/", result)
+    if tilde:
+        result = result.replace("~", "%7E")
+    if plus:
+        result = result.replace("+", "%2B")
+    return result
+
+
+def round_number(x: float) -> str:
+    """Round ``x`` to one decimal (ties round up) and format as a string.
+
+    Mirrors the original Perl ``round_number``: the magnitude is rounded to
+    the nearest tenth and the result is always rendered with at least one
+    decimal digit (whole numbers gain ``.0``).  The sign is preserved.
+    """
+    minus = "-" if x < 0 else ""
+    tenths = int((abs(x) + 0.05) * 10)
+    whole, frac = divmod(tenths, 10)
+    if frac:
+        return f"{minus}{whole}.{frac}"
+    return f"{minus}{whole}.0"
+
+
+def format_bytes(n: int) -> str:
+    """Format a byte count as a human-readable size string.
+
+    Below 1024 the value renders as ``<n> bytes``; otherwise the largest
+    binary unit (KiB / MiB / GiB, all 1024-based) divides it and the quotient
+    is rendered with ``round_number``.  Ports the original Perl
+    ``format_bytes``.
+    """
+    if n < 1024:
+        return f"{n} bytes"
+    if n >= 1024 * 1024 * 1024:
+        value, unit = n / (1024 * 1024 * 1024), "GiB"
+    elif n >= 1024 * 1024:
+        value, unit = n / (1024 * 1024), "MiB"
+    else:
+        value, unit = n / 1024, "KiB"
+    return f"{round_number(value)} {unit}"
+
+
+_RATE_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*([kKmMgG]?)\s*$")
+_RATE_MULTIPLIERS: dict[str, float] = {
+    "k": 1_000.0,
+    "K": 1_000.0,
+    "m": 1_000_000.0,
+    "M": 1_000_000.0,
+    "g": 1_000_000_000.0,
+    "G": 1_000_000_000.0,
+}
+
+
+def parse_rate(value: str) -> float:
+    """Parse a ``limit_rate`` value into bytes per second.
+
+    Accepts a number (int or decimal) with an optional suffix: ``k``/``K``
+    (×1e3), ``m``/``M`` (×1e6), ``g``/``G`` (×1e9), or a bare number.  Raises
+    AptMirrorError (naming the offending literal) for an empty, negative, or
+    non-numeric value.
+    """
+    match = _RATE_RE.match(value)
+    if match is None:
+        raise AptMirrorError(f"apt-mirror: invalid limit_rate '{value}'")
+    number = float(match.group(1))
+    if number < 0:
+        raise AptMirrorError(f"apt-mirror: invalid limit_rate '{value}'")
+    suffix = match.group(2)
+    if not suffix:
+        return number
+    return number * _RATE_MULTIPLIERS[suffix]
 
 
 def _arch_from_options(options: str) -> str | None:
@@ -365,7 +459,13 @@ def parse_config(path: str | Path) -> ParsedConfig:
                 sources.append(repo)
         else:  # clean / skip-clean
             target = clean if line_type == "clean" else skipclean
-            target.add(_sanitise_uri_now(parsed["uri"], variables))
+            target.add(
+                sanitise_uri(
+                    parsed["uri"],
+                    tilde=variables["_tilde"] not in ("", "0"),
+                    plus=variables["_plus"] not in ("", "0"),
+                )
+            )
     return ParsedConfig(
         variables=variables,
         binaries=binaries,
