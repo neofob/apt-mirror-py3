@@ -92,8 +92,9 @@ class _FixtureRequestHandler(BaseHTTPRequestHandler):
         """Run the fixture behaviours for one GET, in a fixed order.
 
         Order: authentication (401), flaky failure (configured code),
-        missing file (404), drop truncation, If-Modified-Since (304),
-        Range (206), then the plain 200.
+        redirect (3xx with Location), missing file (404), drop
+        truncation, If-Modified-Since (304), Range (206), then the plain
+        200.
         """
         if server.required_auth is not None:
             expected_user, expected_password = server.required_auth
@@ -120,6 +121,12 @@ class _FixtureRequestHandler(BaseHTTPRequestHandler):
                 code = None
         if code is not None:
             self._reply(entry, code, body=b"fixture failure")
+            return
+        redirect = server._redirects.get(path)
+        if redirect is not None:
+            code, location = redirect
+            extra = {"Location": location} if location is not None else None
+            self._reply(entry, code, headers=extra)
             return
         file = server._files.get(path)
         if file is None:
@@ -204,7 +211,8 @@ class FixtureServer(ThreadingHTTPServer):
     Serves an in-memory file table and records every request it receives —
     ``method``, ``path``, ``headers`` (lower-cased keys) and the ``status``
     answered — in ``request_log``.  Per-path behaviours are composable:
-    ``require_auth`` (whole server), ``flaky`` and ``drop_after``.  Use as
+    ``require_auth`` (whole server), ``flaky``, ``redirect`` and
+    ``drop_after``.  Use as
     a context manager for per-test isolation:
 
         with FixtureServer() as srv:
@@ -218,6 +226,7 @@ class FixtureServer(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), _FixtureRequestHandler)
         self._files: dict[str, tuple[bytes, float | None]] = {}
         self._flaky: dict[str, tuple[int, int]] = {}
+        self._redirects: dict[str, tuple[int, str | None]] = {}
         self._drops: dict[str, int] = {}
         self.required_auth: tuple[str, str] | None = None
         self.request_log: list[dict[str, object]] = []
@@ -254,6 +263,15 @@ class FixtureServer(ThreadingHTTPServer):
         """
         self._files[path] = (content, last_modified)
         self._drops.pop(path, None)
+
+    def redirect(self, path: str, location: str | None, code: int = 302) -> None:
+        """Answer requests to ``path`` with a 3xx Location for ``location``.
+
+        ``location`` is sent verbatim (absolute or relative to the
+        request); ``None`` means the 3xx carries no Location header at
+        all and must not be followed.
+        """
+        self._redirects[path] = (code, location)
 
     def require_auth(self, username: str, password: str) -> None:
         """Reject every request whose Basic header does not match, with 401."""

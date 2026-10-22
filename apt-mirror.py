@@ -369,6 +369,72 @@ class _TruncatedBodyError(http.client.HTTPException):
     """
 
 
+def _basic_token(username: str, password: str) -> str:
+    """The ``Authorization: Basic`` header value for ``username:password``."""
+    encoded = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+    return f"Basic {encoded}"
+
+
+@dataclass(frozen=True)
+class _Target:
+    """Connection parts of one http(s) URL, plus its Basic credential.
+
+    ``credential`` is the ready-to-send ``Authorization`` value for
+    userinfo embedded in the URL, or None when the URL carries no
+    userinfo; ``origin`` is the RFC 7235 origin (scheme, host, port);
+    ``clean_url`` is the same URL without userinfo, safe for every error
+    message and log line.
+    """
+
+    scheme: str
+    host: str
+    port: int
+    netloc: str
+    target: str
+    clean_url: str
+    origin: tuple[str, str, int]
+    credential: str | None
+
+
+def _parse_target(url: str) -> _Target:
+    """Split an http(s) URL into the parts a fetch needs.
+
+    Raises AptMirrorError (before any connection could be opened) for a
+    non-http(s) scheme and FetchError for an unparseable URL, an
+    out-of-range port, or a URL without a host.  Used for the initial URL
+    and for every redirect Location alike.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        # The port property can also raise ValueError (non-numeric or
+        # out-of-range port), so it stays inside the same guard.
+        port = parsed.port
+    except ValueError as error:
+        raise FetchError(_strip_userinfo(url), f"invalid URL: {error}") from error
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise AptMirrorError(
+            f"apt-mirror: unsupported scheme '{parsed.scheme}' in URL "
+            f"{_strip_userinfo(url)}: only http and https are supported"
+        )
+    host = parsed.hostname
+    if not host:
+        raise FetchError(_strip_userinfo(url), "URL has no host")
+    default_port = 443 if scheme == "https" else 80
+    port = port or default_port
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+    netloc = host if port == default_port else f"{host}:{port}"
+    clean_url = f"{scheme}://{netloc}{target}"
+    credential = None
+    if parsed.username is not None:
+        credential = _basic_token(parsed.username, parsed.password or "")
+    return _Target(
+        scheme, host, port, netloc, target, clean_url, (scheme, host, port), credential
+    )
+
+
 class RateLimiter:
     """Pace a byte stream so its running average stays at or below a ceiling.
 
@@ -405,16 +471,27 @@ class Fetcher:
     with ``http_proxy`` / ``https_proxy`` / ``proxy_user`` /
     ``proxy_password`` routes transfers through a proxy; and
     ``auth_no_challenge`` controls origin Basic authentication.
+    Fetches follow 301/302/303/307/308 Location redirects up to
+    ``max_redirects`` hops (each a fresh GET); a redirect to a different
+    origin drops the Authorization header (RFC 7235), and a Location-less
+    redirect or an exhausted cap is a FetchError.
     """
 
-    def __init__(self, variables: dict[str, str], backoff_base: float = 1.0) -> None:
+    def __init__(
+        self,
+        variables: dict[str, str],
+        backoff_base: float = 1.0,
+        max_redirects: int = 10,
+    ) -> None:
         """Prepare the rate limiter, TLS context, and proxy table.
 
         ``backoff_base`` scales the retry backoff schedule (base, 2x, 4x,
-        8x seconds between the up-to-5 attempts) and exists so tests can
-        keep it fast.
+        8x seconds between the up-to-5 attempts); ``max_redirects`` caps
+        the Location redirects followed by each fetch (default 10); both
+        exist so tests can keep them fast.
         """
         self._backoff_base = backoff_base
+        self._max_redirects = max_redirects
         self._limiter = RateLimiter(
             parse_rate(variables.get("limit_rate", DEFAULT_CONFIG["limit_rate"]))
         )
@@ -576,6 +653,75 @@ class Fetcher:
             response.close()
         return total
 
+    def _walk_redirects(
+        self,
+        auth_state: dict[tuple[str, str, int], tuple[str | None, bool]],
+        current: _Target,
+        base_headers: dict[str, str],
+    ) -> tuple[http.client.HTTPResponse, _Target, http.client.HTTPConnection]:
+        """GET ``current``, following Location redirects up to the hop cap.
+
+        Returns the final response (still open) with the final target and
+        its open connection.  Every redirect issues a fresh GET on a
+        fresh connection; a relative Location resolves against the current
+        URL.  ``auth_state`` maps an origin to (credential, already sent)
+        and is the source of truth for Authorization across hops: a
+        same-origin redirect keeps its entry, a new origin starts with any
+        userinfo embedded in the Location — anything else means the header
+        is dropped (RFC 7235).  A 3xx without a usable Location, an
+        exhausted cap, and a redirect to a foreign scheme raise
+        FetchError/AptMirrorError; none of these count against the
+        caller's retry budget.
+        """
+        hops = 0
+        while True:
+            headers = dict(base_headers)
+            credential, sent = auth_state[current.origin]
+            if credential is not None and sent:
+                headers["Authorization"] = credential
+            conn, request_url = self._connect(
+                current.scheme,
+                current.host,
+                current.port,
+                current.netloc,
+                current.target,
+                headers,
+            )
+            conn.request("GET", request_url, headers=headers)
+            response = conn.getresponse()
+            status = response.status
+            if status not in (301, 302, 303, 307, 308):
+                return response, current, conn
+            location = response.getheader("Location")
+            response.close()
+            conn.close()
+            if not location:
+                raise FetchError(
+                    current.clean_url,
+                    f"HTTP {status} without a usable Location header",
+                )
+            hops += 1
+            if hops > self._max_redirects:
+                raise FetchError(
+                    current.clean_url,
+                    f"too many redirects (cap is {self._max_redirects})",
+                )
+            try:
+                next_url = urllib.parse.urljoin(current.clean_url, location)
+            except ValueError as error:
+                raise FetchError(
+                    current.clean_url, f"invalid redirect Location: {error}"
+                ) from error
+            next_target = _parse_target(next_url)
+            auth_state.setdefault(
+                next_target.origin,
+                (
+                    next_target.credential,
+                    next_target.credential is not None and self._auth_no_challenge,
+                ),
+            )
+            current = next_target
+
     def fetch(self, url: str, dest: Path) -> int:
         """Download ``url`` to ``dest`` atomically; return bytes written.
 
@@ -589,66 +735,47 @@ class Fetcher:
         URL is stripped and sent as ``Authorization: Basic`` — always when
         ``auth_no_challenge`` is on, otherwise only after an initial 401
         challenge (one immediate, undelayed retry) — and never appears in
-        any error, log line, or file.  An existing ``dest`` triggers
-        ``If-Modified-Since`` (304 -> 0); an existing ``<dest>.part``
-        triggers ``Range: bytes=N-`` resume (206 appends, 200 restarts);
-        on success the part is ``os.replace``d onto ``dest``.  Connection
-        errors, timeouts, 429, and 5xx raise FetchError after up to
-        _MAX_ATTEMPTS attempts with exponential backoff; 404 raises
-        FetchNotFound and any other 4xx raises FetchError immediately.
+        any error, log line, or file.  301/302/303/307/308 responses are
+        followed per their Location header up to ``max_redirects`` hops,
+        each a fresh GET that does not count against the retry budget;
+        a redirect to a different origin drops Authorization (RFC 7235),
+        and a Location-less redirect or an exhausted cap is a FetchError.
+        An existing ``dest`` triggers ``If-Modified-Since`` (304 -> 0); an
+        existing ``<dest>.part`` triggers ``Range: bytes=N-`` resume (206
+        appends, 200 restarts); on success the part is ``os.replace``d
+        onto ``dest``.  Connection errors, timeouts, 429, and 5xx raise
+        FetchError after up to _MAX_ATTEMPTS attempts with exponential
+        backoff; 404 raises FetchNotFound and any other 4xx raises
+        FetchError immediately.
         """
-        try:
-            parsed = urllib.parse.urlsplit(url)
-        except ValueError as error:
-            raise FetchError(_strip_userinfo(url), f"invalid URL: {error}") from error
-        scheme = parsed.scheme.lower()
-        if scheme not in ("http", "https"):
-            raise AptMirrorError(
-                f"apt-mirror: unsupported scheme '{parsed.scheme}' in URL "
-                f"{_strip_userinfo(url)}: only http and https are supported"
+        first = _parse_target(url)
+        auth_state: dict[tuple[str, str, int], tuple[str | None, bool]] = {
+            first.origin: (
+                first.credential,
+                first.credential is not None and self._auth_no_challenge,
             )
-        host = parsed.hostname
-        if not host:
-            raise FetchError(_strip_userinfo(url), "URL has no host")
-        default_port = 443 if scheme == "https" else 80
-        port = parsed.port or default_port
-        target = parsed.path or "/"
-        if parsed.query:
-            target = f"{target}?{parsed.query}"
-        netloc = host if port == default_port else f"{host}:{port}"
-        # Credential-free URL used in every FetchError attribute, message,
-        # and log line from here on.
-        clean_url = f"{scheme}://{netloc}{target}"
-        username = parsed.username
-        password = parsed.password or ""
-        auth_header = None
-        if username is not None:
-            token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
-            auth_header = f"Basic {token}"
+        }
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = Path(str(dest) + ".part")
-        sent_auth = auth_header is not None and self._auth_no_challenge
         attempt = 0
         reason = "no attempt made"
+        clean_url = first.clean_url
         while True:
             attempt += 1
             conn: http.client.HTTPConnection | None = None
             try:
-                headers: dict[str, str] = {"User-Agent": "apt-mirror (python3)"}
+                base_headers: dict[str, str] = {"User-Agent": "apt-mirror (python3)"}
                 part_size = part.stat().st_size if part.exists() else 0
                 if part_size:
-                    headers["Range"] = f"bytes={part_size}-"
+                    base_headers["Range"] = f"bytes={part_size}-"
                 elif dest.exists():
-                    headers["If-Modified-Since"] = email.utils.formatdate(
+                    base_headers["If-Modified-Since"] = email.utils.formatdate(
                         timeval=dest.stat().st_mtime, usegmt=True
                     )
-                if sent_auth:
-                    headers["Authorization"] = auth_header
-                conn, request_url = self._connect(
-                    scheme, host, port, netloc, target, headers
+                response, final, conn = self._walk_redirects(
+                    auth_state, first, base_headers
                 )
-                conn.request("GET", request_url, headers=headers)
-                response = conn.getresponse()
+                clean_url = final.clean_url
                 status = response.status
                 if status == 304:
                     response.close()
@@ -674,11 +801,12 @@ class Fetcher:
                     return written
                 if status == 401:
                     response.close()
-                    if auth_header is not None and not sent_auth:
-                        # The server is challenging: retry once,
-                        # immediately, with the credential already at hand.
-                        # Not a failed attempt (no backoff).
-                        sent_auth = True
+                    credential, sent = auth_state[final.origin]
+                    if credential is not None and not sent:
+                        # The server is challenging: raise the flag and
+                        # re-walk immediately with the credential already
+                        # at hand.  Not a failed attempt (no backoff).
+                        auth_state[final.origin] = (credential, True)
                         attempt -= 1
                         continue
                     reason = "HTTP 401 (authentication failed)"

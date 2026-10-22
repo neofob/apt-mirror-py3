@@ -167,6 +167,62 @@ class TestCredentials:
             assert all("wrongpass" not in r.message for r in caplog.records)
 
 
+class TestRedirects:
+    """Location redirects (301/302/303/307/308) are followed, bounded."""
+
+    def test_redirect_chain_to_second_server(self, am, tmp_path) -> None:
+        with FixtureServer() as srv_a, FixtureServer() as srv_b:
+            srv_b.add("/real", b"redirected")
+            srv_a.redirect("/r", srv_b.url("/real"))
+            fetcher = am.Fetcher({"limit_rate": "100m"}, backoff_base=0.01)
+            dest = tmp_path / "real"
+            written = fetcher.fetch(srv_a.url("/r"), dest)
+            assert written == len(b"redirected")
+            assert dest.read_bytes() == b"redirected"
+            assert srv_a.count("/r") == 1
+            assert srv_a.request_log[0]["status"] == 302
+            assert srv_b.count("/real") == 1
+            assert srv_b.request_log[0]["method"] == "GET"
+
+    def test_cross_origin_redirect_drops_authorization(self, am, tmp_path) -> None:
+        with FixtureServer() as srv_a, FixtureServer() as srv_b:
+            srv_b.add("/real", b"open target")
+            srv_a.redirect("/r", srv_b.url("/real"))
+            url = srv_a.url("/r").replace("://", "://u:s3cr3t@", 1)
+            fetcher = am.Fetcher(
+                {"limit_rate": "100m", "auth_no_challenge": "1"},
+                backoff_base=0.01,
+            )
+            assert fetcher.fetch(url, tmp_path / "real") == len(b"open target")
+            assert (tmp_path / "real").read_bytes() == b"open target"
+            assert srv_a.request_log[0]["headers"]["authorization"] == _basic(
+                "u", "s3cr3t"
+            )
+            # Cross-origin: the credential must not travel to the other host.
+            assert "authorization" not in srv_b.request_log[0]["headers"]
+
+    def test_redirect_cap_stops_a_loop(self, am, tmp_path) -> None:
+        with FixtureServer() as srv:
+            srv.redirect("/loop", srv.url("/loop"))
+            fetcher = am.Fetcher(
+                {"limit_rate": "100m"}, backoff_base=0.01, max_redirects=2
+            )
+            with pytest.raises(am.FetchError) as excinfo:
+                fetcher.fetch(srv.url("/loop"), tmp_path / "loop")
+            assert "too many redirects" in excinfo.value.reason
+            # 1 request + the 2 followed hops, then the cap stops the loop.
+            assert srv.count("/loop") == 3
+
+    def test_3xx_without_location_fails(self, am, tmp_path) -> None:
+        with FixtureServer() as srv:
+            srv.redirect("/dangling", None)
+            fetcher = am.Fetcher({"limit_rate": "100m"}, backoff_base=0.01)
+            with pytest.raises(am.FetchError) as excinfo:
+                fetcher.fetch(srv.url("/dangling"), tmp_path / "dangling")
+            assert "location" in excinfo.value.reason.lower()
+            assert srv.count("/dangling") == 1
+
+
 class TestRateLimiter:
     """pace() keeps a steady stream of calls at or below the rate."""
 
