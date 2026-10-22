@@ -558,6 +558,9 @@ class Fetcher:
                 proxy = urllib.parse.urlsplit(raw)
                 if proxy.scheme not in ("http", "https") or not proxy.hostname:
                     raise ValueError("missing host")
+                # The port property also raises ValueError (non-numeric or
+                # out-of-range port), so it stays inside the same guard.
+                port = proxy.port
             except ValueError:
                 raise AptMirrorError(
                     f"apt-mirror: invalid proxy URL for '{key}'"
@@ -571,7 +574,7 @@ class Fetcher:
             if username:
                 token = base64.b64encode(f"{username}:{password}".encode())
                 auth = b"Basic " + token
-            proxies[target_scheme] = (proxy.hostname, proxy.port or 80, auth)
+            proxies[target_scheme] = (proxy.hostname, port or 80, auth)
         return proxies
 
     def _connect(

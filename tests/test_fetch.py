@@ -255,3 +255,22 @@ class TestFetcherConfig:
             srv.add("/d.txt", b"1234")
             fetcher = am.Fetcher({})
             assert fetcher.fetch(srv.url("/d.txt"), tmp_path / "d.txt") == 4
+
+
+class TestProxyConfig:
+    """Proxy URLs are validated at construction through the error contract."""
+
+    def test_out_of_range_proxy_port_is_an_apt_mirror_error(self, am) -> None:
+        with pytest.raises(am.AptMirrorError) as excinfo:
+            am.Fetcher({"use_proxy": "on", "http_proxy": "http://127.0.0.1:99999"})
+        message = str(excinfo.value)
+        assert "apt-mirror:" in message
+        assert "http_proxy" in message
+        # The invalid URL must not be echoed (it may carry secrets).
+        assert "127.0.0.1" not in message
+
+    def test_well_formed_proxy_url_constructs(self, am) -> None:
+        fetcher = am.Fetcher({"use_proxy": "on", "http_proxy": "http://127.0.0.1:8123"})
+        assert fetcher._proxies["http"] == ("127.0.0.1", 8123, None)
+        fetcher = am.Fetcher({"use_proxy": "on", "http_proxy": "http://127.0.0.1"})
+        assert fetcher._proxies["http"] == ("127.0.0.1", 80, None)
