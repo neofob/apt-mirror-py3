@@ -2065,10 +2065,14 @@ def _mirror_run(configfile: str) -> int:
             """The usable InRelease (else Release) of ``spec``.
 
             A local copy that exists but is empty or fails parse_release
-            is deleted and re-fetched once.  When neither file yields a
-            parseable Release the exact original warning is printed (to
-            stderr) and None is returned so the caller falls back to the
-            well-known index set."""
+            is deleted and re-fetched once.  Every warning carried by a
+            usable ReleaseInfo (Task 5's malformed-continuation lines,
+            spec §5.6) is emitted to stderr, verbatim, right after the
+            parse that produced it — both the initial and the
+            re-fetch paths land on the same return.  When neither file
+            yields a parseable Release the exact original warning is
+            printed (to stderr) and None is returned so the caller falls
+            back to the well-known index set."""
             for name in ("InRelease", "Release"):
                 url = dist_base(spec) + name
                 path = skel_path / sanitise_uri(url, tilde, plus)
@@ -2079,6 +2083,8 @@ def _mirror_run(configfile: str) -> int:
                         fetcher.fetch(url, path)
                     info = valid_release_info(path)
                 if info is not None:
+                    for warning in info.warnings:
+                        print(warning, file=sys.stderr)
                     return info
             print(
                 "Failed to find InRelease or Release in "
@@ -2203,13 +2209,14 @@ def _mirror_run(configfile: str) -> int:
                     if rec.sha256 is not None:
                         sha256_lines.append(f"{rec.sha256}  {rec.mirror_rel}")
                     if need_update(mirror_path / rec.mirror_rel, rec.size):
-                        # The original prints the full URL to NEW and
-                        # queues the very same remove_double_slashes'd URL
-                        # for the archive download.
+                        # Full (possibly userinfo-carrying) URL for the
+                        # download queue; var/NEW is a persisted file and
+                        # must carry the credential-stripped form only
+                        # (spec §7.1 fix #2).
                         download_url = remove_double_slashes(
                             f"{spec.uri}/{rec.url_rel}"
                         )
-                        new_lines.append(download_url)
+                        new_lines.append(_strip_userinfo(download_url))
                         archive_urls[download_url] = rec.size
                 return
             if not optional:

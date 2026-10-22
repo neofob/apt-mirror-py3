@@ -25,12 +25,16 @@ from the task brief (step 1) and the controller clarifications:
 """
 
 import fcntl
+import gzip
+import hashlib
 import os
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
+
+from .conftest import FixtureServer
 
 
 def _write(path: Path, content: bytes) -> None:
@@ -277,3 +281,83 @@ class TestLocked:
         with am.locked(var):
             assert lock_path.exists()  # held while the body runs
         assert not lock_path.exists()  # removed on exit
+
+
+# ---------------------------------------------------------------------------
+# main(): Release warning emission + var/NEW credential stripping
+# ---------------------------------------------------------------------------
+
+
+class TestMainReleaseWarningsAndCredentialStrip:
+    """One in-process main() run over a single canonical binary repo whose
+    Release carries a malformed checksum continuation, served under a
+    userinfo-embedded config URI.
+
+    Pins the 2026-10-22 review fixes: spec §5.6 step 2 (each
+    ``ReleaseInfo.warnings`` entry is printed to stderr, verbatim, as Task 5
+    builds it) and spec §7.1 fix #2 (a persisted file never carries
+    ``user:pass@`` — var/NEW lines strip the userinfo while the fetcher
+    still receives the full URL).
+    """
+
+    def test_warns_malformed_line_and_strips_new_credentials(
+        self, am, tmp_path, capsys
+    ) -> None:
+        def build(srv: FixtureServer) -> None:
+            deb = b"deb-payload-" * 10
+            packages = (
+                "Package: foo\n"
+                "Architecture: amd64\n"
+                "Version: 1.0-1\n"
+                "Filename: pool/main/f/foo/foo_1.0-1_amd64.deb\n"
+                f"Size: {len(deb)}\n"
+                f"MD5sum: {hashlib.md5(deb).hexdigest()}\n"
+                f"SHA1: {hashlib.sha1(deb).hexdigest()}\n"
+                f"SHA256: {hashlib.sha256(deb).hexdigest()}\n"
+                "\n"
+            ).encode()
+            packages_gz = gzip.compress(packages, mtime=0)
+            bad_content = "deadbeefcafe 1234"  # 2 fields, no filename
+            release = (
+                "Origin: review\nSuite: stable\nCodename: review\n"
+                "SHA256:\n"
+                f"  {hashlib.sha256(packages_gz).hexdigest()} "
+                f"{len(packages_gz)} main/binary-amd64/Packages.gz\n"
+                f"  {bad_content}\n"
+            ).encode()
+            srv.add("/repo/dists/stable/Release", release)
+            srv.add("/repo/dists/stable/main/binary-amd64/Packages.gz", packages_gz)
+            srv.add("/repo/pool/main/f/foo/foo_1.0-1_amd64.deb", deb)
+
+        with FixtureServer() as srv:
+            build(srv)
+            port = srv.port
+            spool = tmp_path / "spool"
+            config = tmp_path / "mirror.list"
+            # The URI embeds userinfo; the fixture does not require auth —
+            # the fetch simply carries (and is not denied by) the header.
+            config.write_text(
+                f"set base_path {spool}\n"
+                "set nthreads 2\n"
+                f"deb http://u:p@127.0.0.1:{port}/repo stable main\n"
+            )
+            rc = am.main([str(config)])
+            captured = capsys.readouterr()
+
+        assert rc == 0
+        host = f"127.0.0.1:{port}"
+        var = spool / "var"
+        # mirror-relative (sanitised, credential-free) on skel-tree layout.
+        assert (var / "ALL").read_text().splitlines() == [
+            f"{host}/repo/pool/main/f/foo/foo_1.0-1_amd64.deb"
+        ]
+        # NEW: exactly the full repo-root URL, userinfo-stripped.
+        new_lines = (var / "NEW").read_text().splitlines()
+        assert new_lines == [f"http://{host}/repo/pool/main/f/foo/foo_1.0-1_amd64.deb"]
+        assert "u:p@" not in (var / "NEW").read_text()
+        # Spec §5.6 step 2: the malformed-continuation warning on stderr,
+        # exactly as ReleaseInfo.warnings builds it (message names the
+        # skel-local Release path).
+        release_path = spool / "skel" / host / "repo" / "dists" / "stable" / "Release"
+        expected = f'Malformed checksum line "deadbeefcafe 1234" in {release_path}'
+        assert expected in captured.err
