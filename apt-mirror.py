@@ -480,12 +480,14 @@ class Fetcher:
     """Download files over HTTP(S) with atomic writes, resume, and retries.
 
     Built from the spec §5.1 config ``variables``: ``limit_rate`` (an
-    invalid value raises AptMirrorError via parse_rate) drives a
-    per-Fetcher RateLimiter; ``no_check_certificate``, ``ca_certificate``,
-    ``certificate`` and ``private_key`` shape the TLS context; ``use_proxy``
-    with ``http_proxy`` / ``https_proxy`` / ``proxy_user`` /
-    ``proxy_password`` routes transfers through a proxy; and
-    ``auth_no_challenge`` controls origin Basic authentication.
+    invalid value raises AptMirrorError via parse_rate) sets the per-
+    transfer rate — every fetch() call paces its own body reads with a
+    fresh RateLimiter (spec §5.3: the limit is per transfer, matching
+    per-wget-process semantics); ``no_check_certificate``,
+    ``ca_certificate``, ``certificate`` and ``private_key`` shape the TLS
+    context; ``use_proxy`` with ``http_proxy`` / ``https_proxy`` /
+    ``proxy_user`` / ``proxy_password`` routes transfers through a proxy;
+    and ``auth_no_challenge`` controls origin Basic authentication.
     Fetches follow 301/302/303/307/308 Location redirects up to
     ``max_redirects`` hops (each a fresh GET); a redirect to a different
     origin drops the Authorization header (RFC 7235), and a Location-less
@@ -507,8 +509,10 @@ class Fetcher:
         """
         self._backoff_base = backoff_base
         self._max_redirects = max_redirects
-        self._limiter = RateLimiter(
-            parse_rate(variables.get("limit_rate", DEFAULT_CONFIG["limit_rate"]))
+        # The rate VALUE is parsed once; each fetch() gets its own fresh
+        # RateLimiter built from it (spec §5.3: per-transfer pacing).
+        self._rate_bps = parse_rate(
+            variables.get("limit_rate", DEFAULT_CONFIG["limit_rate"])
         )
         self._auth_no_challenge = _config_on(variables.get("auth_no_challenge") or "0")
         self._tls_context = self._build_tls_context(variables)
@@ -519,7 +523,8 @@ class Fetcher:
         """Build the TLS context for https URLs (spec §5.1).
 
         ``no_check_certificate`` disables verification entirely (documented
-        as insecure); ``ca_certificate`` replaces the default trust store;
+        as insecure); ``ca_certificate`` loads additional CAs on top of the
+        default trust store (additive — it does not replace the defaults);
         ``certificate`` plus ``private_key`` add a client certificate.  A
         missing or unreadable file raises AptMirrorError.
         """
@@ -556,11 +561,13 @@ class Fetcher:
         """Build the per-scheme proxy table, only when use_proxy is on.
 
         Maps a target scheme to (proxy host, proxy port, an optional
-        Proxy-Authorization header).  The proxy URL is always dialed in
-        the clear (https targets are CONNECT-tunnelled through it).
-        Userinfo embedded in the proxy URL wins over the separate
-        proxy_user / proxy_password variables.  An invalid proxy URL is an
-        AptMirrorError that does not echo the URL (it may carry secrets).
+        Proxy-Authorization header).  The connection to the proxy itself
+        is always plain HTTP; https targets are CONNECT-tunnelled through
+        it, so the tunneled payload still travels as TLS to the origin
+        (the proxy sees only the encrypted stream).  Userinfo embedded in
+        the proxy URL wins over the separate proxy_user / proxy_password
+        variables.  An invalid proxy URL is an AptMirrorError that does
+        not echo the URL (it may carry secrets).
         """
         proxies: dict[str, tuple[str, int, bytes | None]] = {}
         if not _config_on(variables.get("use_proxy") or "off"):
@@ -625,7 +632,17 @@ class Fetcher:
                 timeout=_SOCKET_TIMEOUT,
                 context=self._tls_context,
             )
-            conn.set_tunnel(host, port, proxy_authorization=proxy_auth or b"")
+            # The portable way to carry proxy credentials on the CONNECT
+            # request: the set_tunnel() headers mapping.  The keyword is
+            # the supported one on every released CPython (there is no
+            # proxy_authorization parameter — passing one is a TypeError).
+            conn.set_tunnel(
+                host,
+                port,
+                None
+                if proxy_auth is None
+                else {"Proxy-Authorization": proxy_auth.decode("ascii")},
+            )
             return conn, target
         conn = http.client.HTTPConnection(
             proxy_host, proxy_port, timeout=_SOCKET_TIMEOUT
@@ -652,9 +669,14 @@ class Fetcher:
             raise _TruncatedBodyError(f"received {written} of {expected} bytes")
 
     def _write_body(
-        self, response: http.client.HTTPResponse, part: Path, mode: str
+        self,
+        response: http.client.HTTPResponse,
+        part: Path,
+        mode: str,
+        limiter: RateLimiter,
     ) -> int:
-        """Stream the response into ``part``, pacing each chunk to the rate.
+        """Stream the response into ``part``, pacing each chunk with the
+        transfer's own RateLimiter (spec §5.3: the limit is per transfer).
 
         Returns the bytes written this call.  On a truncated body the HTTP
         exception propagates to the caller's retry logic while the partial
@@ -664,7 +686,7 @@ class Fetcher:
         try:
             with open(part, mode) as handle:
                 while chunk := response.read(_CHUNK_SIZE):
-                    self._limiter.pace(len(chunk))
+                    limiter.pace(len(chunk))
                     handle.write(chunk)
                     total += len(chunk)
         finally:
@@ -759,12 +781,18 @@ class Fetcher:
         a redirect to a different origin drops Authorization (RFC 7235),
         and a Location-less redirect or an exhausted cap is a FetchError.
         An existing ``dest`` triggers ``If-Modified-Since`` (304 -> 0); an
-        existing ``<dest>.part`` triggers ``Range: bytes=N-`` resume (206
-        appends, 200 restarts); on success the part is ``os.replace``d
-        onto ``dest``.  Connection errors, timeouts, 429, and 5xx raise
-        FetchError after up to _MAX_ATTEMPTS attempts with exponential
-        backoff; 404 raises FetchNotFound and any other 4xx raises
-        FetchError immediately.
+        existing non-empty ``dest`` also deletes any stale ``<dest>.part``
+        first (a complete file must ride the IMS branch — resuming onto a
+        stale partial could persist a corrupt hybrid); a ``<dest>.part``
+        without a complete dest triggers ``Range: bytes=N-`` resume (206
+        appends, 200 restarts).  A 206 whose Content-Range does not start
+        at the partial's end, and a 416 (unsatisfiable Range, e.g. the
+        server file shrank) both drop the part and retry the attempt
+        cleanly without backoff, bounded by the attempt cap.  On success
+        the part is ``os.replace``d onto ``dest``.  Connection errors,
+        timeouts, 429, and 5xx raise FetchError after up to _MAX_ATTEMPTS
+        attempts with exponential backoff; 404 raises FetchNotFound and
+        any other 4xx raises FetchError immediately.
         """
         first = _parse_target(url)
         auth_state: dict[tuple[str, str, int], tuple[str | None, bool]] = {
@@ -775,14 +803,28 @@ class Fetcher:
         }
         dest.parent.mkdir(parents=True, exist_ok=True)
         part = Path(str(dest) + ".part")
+        # One fresh limiter per transfer (spec §5.3: the rate limit is per
+        # transfer, matching per-wget-process semantics — N concurrent
+        # transfers each run at the full rate, not an aggregate N shares).
+        limiter = RateLimiter(self._rate_bps)
         attempt = 0
         reason = "no attempt made"
         clean_url = first.clean_url
         while True:
             attempt += 1
             conn: http.client.HTTPConnection | None = None
+            no_backoff = False
             try:
                 base_headers: dict[str, str] = {"User-Agent": "apt-mirror (python3)"}
+                if dest.exists() and dest.stat().st_size:
+                    # A complete (non-empty) destination outranks any stale
+                    # <dest>.part left by an interrupted re-download: the
+                    # part is deleted and the server decides via
+                    # If-Modified-Since.  Resuming by Range applies to a
+                    # *partial* local file only (spec §5.3) — resuming onto
+                    # a changed file could append a new tail to an old
+                    # prefix and persist the corrupt hybrid.
+                    part.unlink(missing_ok=True)
                 part_size = part.stat().st_size if part.exists() else 0
                 if part_size:
                     base_headers["Range"] = f"bytes={part_size}-"
@@ -803,17 +845,25 @@ class Fetcher:
                     return 0
                 if status == 200:
                     expected = response.length
-                    written = self._write_body(response, part, "wb")
+                    written = self._write_body(response, part, "wb", limiter)
                     self._require_complete(written, expected)
                     os.replace(part, dest)
                     return written
                 if status == 206:
                     expected = response.length
                     start = self._range_start(response)
-                    # A 206 that does not start where our partial ends is
-                    # unusable for appending — restart from scratch.
-                    mode = "ab" if start in (None, part_size) else "wb"
-                    written = self._write_body(response, part, mode)
+                    if start is not None and start != part_size:
+                        # The server's range does not start where our
+                        # partial ends: appending would corrupt the file.
+                        # Discard the partial and retry cleanly — a full
+                        # GET without Range, no backoff (the 416 /
+                        # mismatch self-heal), bounded by the attempt cap.
+                        response.close()
+                        part.unlink(missing_ok=True)
+                        reason = "HTTP 206 with a mismatched Content-Range"
+                        no_backoff = True
+                        continue
+                    written = self._write_body(response, part, "ab", limiter)
                     self._require_complete(written, expected)
                     os.replace(part, dest)
                     return written
@@ -830,6 +880,16 @@ class Fetcher:
                     reason = "HTTP 401 (authentication failed)"
                     logger.warning("%s: %s", clean_url, reason)
                     raise FetchError(clean_url, reason)
+                if status == 416:
+                    # Our Range was unsatisfiable (e.g. the server file
+                    # shrank): the stale partial is hopeless — drop it and
+                    # retry the attempt cleanly without backoff (no Range
+                    # next: the part is gone).  Bounded by the cap.
+                    response.close()
+                    part.unlink(missing_ok=True)
+                    reason = "HTTP 416 (requested range unavailable)"
+                    no_backoff = True
+                    continue
                 response.close()
                 reason = f"HTTP {status}"
                 if status == 404:
@@ -850,6 +910,15 @@ class Fetcher:
                 raise FetchError(
                     clean_url, f"{reason} (after {_MAX_ATTEMPTS} attempts)"
                 )
+            if no_backoff:
+                logger.warning(
+                    "%s: %s (attempt %d of %d); retrying cleanly",
+                    clean_url,
+                    reason,
+                    attempt,
+                    _MAX_ATTEMPTS,
+                )
+                continue
             delay = self._backoff_base * (2 ** (attempt - 1))
             logger.warning(
                 "%s: %s (attempt %d of %d); retrying in %.3fs",
@@ -1118,7 +1187,13 @@ def parse_config(path: str | Path) -> ParsedConfig:
     sources: list[Repo] = []
     clean: set[str] = set()
     skipclean: set[str] = set()
-    text = config_path.read_text(encoding="utf-8")
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise AptMirrorError(
+            f"apt-mirror: invalid config file specified ({config_path}):"
+            " not valid UTF-8"
+        ) from None
     for line_number, raw_line in enumerate(text.split("\n"), start=1):
         line = raw_line.rstrip("\r").strip()
         try:
@@ -1184,8 +1259,12 @@ HASH_STRENGTH: tuple[str, ...] = ("SHA512", "SHA256", "SHA1", "MD5Sum")
 _RELEASE_EXT_RE = r"\.(?:gz|bz2|xz|lzma)"
 KNOWN_EXTENSIONS: tuple[str, ...] = (".gz", ".xz", ".bz2", ".lzma", "")
 
-#: A hash-section header line, exactly one of the four names followed by ":".
-_HASH_HEADER_RE = re.compile(r"^(?P<hash>" + "|".join(HASH_STRENGTH) + r"):$")
+#: A generic "WORD:" line ending a header: any hash-section name,
+#: supported or not (e.g. ``SHA384:``).  A Release may list files only
+#: under sections we do not support; recording them (with the raw section
+#: name) keeps the filenames visible so index_urls_for can warn and fall
+#: back to the canonical location (spec §5.6.3).
+_ANY_HASH_HEADER_RE = re.compile(r"^(?P<hash>[A-Za-z0-9]+):$")
 #: A hash-section continuation line: leading whitespace plus its remainder.
 _HASH_LINE_RE = re.compile(r"^ +(.*)$")
 
@@ -1230,7 +1309,7 @@ def parse_release(path: Path) -> ReleaseInfo:
     """
     info = ReleaseInfo(by_hash=False, entries={}, warnings=[])
     current_hash: str | None = None
-    for raw_line in path.read_text(encoding="utf-8").split("\n"):
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").split("\n"):
         line = raw_line.rstrip("\r")
         if current_hash is not None:
             match = _HASH_LINE_RE.match(line)
@@ -1253,7 +1332,7 @@ def parse_release(path: Path) -> ReleaseInfo:
                     info.entries.setdefault(entry.filename, []).append(entry)
                 continue
             current_hash = None
-        header = _HASH_HEADER_RE.match(line)
+        header = _ANY_HASH_HEADER_RE.match(line)
         if header is not None:
             current_hash = header.group("hash")
         elif line == "Acquire-By-Hash: yes":
@@ -1381,7 +1460,9 @@ def index_urls_for(spec: Repo, info: ReleaseInfo) -> list[IndexUrl]:
     only under a weaker section are still mirrored, not silently dropped);
     a filename with no advertised entries — and every file when the
     request is absent or not exactly ``yes`` — falls back to the canonical
-    path (``by_hash is None``).
+    path (``by_hash is None``).  A file listed only under sections we do
+    not support (e.g. SHA384) likewise falls back to canonical, but
+    raises a warning naming the file (spec §5.6.3).
     """
     patterns = _index_patterns(spec)
     urls: list[IndexUrl] = []
@@ -1398,6 +1479,12 @@ def index_urls_for(spec: Repo, info: ReleaseInfo) -> list[IndexUrl]:
                 by_hashsum=strongest.hashsum,
             )
         else:
+            if info.by_hash and strongest is None:
+                logger.warning(
+                    "apt-mirror: no supported hash (SHA512/SHA256/SHA1/MD5Sum)"
+                    " for %s; falling back to its canonical location",
+                    filename,
+                )
             url = IndexUrl(
                 filename=filename,
                 size=strongest.size if strongest is not None else 0,
@@ -1420,7 +1507,10 @@ def _known_base_paths(spec: Repo) -> list[str]:
     per-component ``source/Sources`` and ``Contents-source`` for a source
     repo (under ``dists/<distribution>`` — the original omitted that
     segment for source lines and never mirrored them, spec §7.1 fix #1),
-    and flat variants with no ``dists/`` segment at all.
+    and flat variants with no ``dists/`` segment at all.  A comma-
+    separated ``arch`` list (spec §5.1: ``arch=a,b`` is honoured) yields
+    one ``binary-<arch>/Packages`` / ``Contents-<arch>`` base per arch,
+    while ``binary-all`` / ``Contents-all`` appear exactly once.
     """
     dist = spec.distribution
     if spec.type == "deb-src":
@@ -1429,22 +1519,21 @@ def _known_base_paths(spec: Repo) -> list[str]:
         bases = [f"dists/{dist}/{comp}/source/Sources" for comp in spec.components]
         bases += [f"dists/{dist}/{comp}/Contents-source" for comp in spec.components]
     else:
+        archs = [arch for arch in spec.arch.split(",") if arch]
         if spec.components is None:
-            return [
-                f"{dist}/Packages",
-                f"{dist}/Contents-{spec.arch}",
-                f"{dist}/Contents-all",
-            ]
+            return (
+                [f"{dist}/Packages"]
+                + [f"{dist}/Contents-{arch}" for arch in archs]
+                + [f"{dist}/Contents-all"]
+            )
         bases = []
         for comp in spec.components:
-            bases += [
-                f"dists/{dist}/{comp}/binary-{spec.arch}/Packages",
-                f"dists/{dist}/{comp}/binary-all/Packages",
-                f"dists/{dist}/{comp}/Contents-{spec.arch}",
-                f"dists/{dist}/{comp}/Contents-all",
-                f"dists/{dist}/Contents-{spec.arch}",
-                f"dists/{dist}/Contents-all",
-            ]
+            bases += [f"dists/{dist}/{comp}/binary-{arch}/Packages" for arch in archs]
+            bases.append(f"dists/{dist}/{comp}/binary-all/Packages")
+            bases += [f"dists/{dist}/{comp}/Contents-{arch}" for arch in archs]
+            bases.append(f"dists/{dist}/{comp}/Contents-all")
+            bases += [f"dists/{dist}/Contents-{arch}" for arch in archs]
+            bases.append(f"dists/{dist}/Contents-all")
     return list(dict.fromkeys(bases))
 
 
@@ -2134,9 +2223,32 @@ def _mirror_run(configfile: str) -> int:
                     hashsum_to_canonical.setdefault(hash_tree, []).append(
                         canonical_tree
                     )
-                    canonical_to_hashsums.setdefault(canonical_tree, []).append(
-                        hash_tree
-                    )
+                    canon_hashes = canonical_to_hashsums.setdefault(canonical_tree, [])
+                    canon_hashes.append(hash_tree)
+                    # The original's file_to_hashsums maps a file to the
+                    # by-hash path of EVERY supported section it advertises,
+                    # so the skel->mirror stage hardlinks the one download
+                    # to all of them, not just the strongest fetched.
+                    if info is not None:
+                        for entry in info.entries.get(idx.filename, []):
+                            if entry.hashname not in HASH_STRENGTH:
+                                continue
+                            name = entry.hashname.lower()
+                            if name == idx.by_hash:
+                                continue
+                            other_path = (
+                                f"{posixpath.dirname(idx.filename)}/by-hash/"
+                                f"{name}/{entry.hashsum}"
+                            )
+                            other_tree = sanitise_uri(
+                                remove_double_slashes(base_url + "/" + other_path),
+                                tilde,
+                                plus,
+                            )
+                            if other_tree in canon_hashes:
+                                continue
+                            skipclean.add(other_tree)
+                            canon_hashes.append(other_tree)
                 if url not in index_urls_seen:
                     index_urls_seen.add(url)
                     index_urls.append(url)
@@ -2256,22 +2368,28 @@ def _mirror_run(configfile: str) -> int:
             # One P per binary spec.
             marks.append("P")
             if spec.components is not None:
+                # A comma-separated arch list is honoured (spec §5.1):
+                # every arch gets its binary-<arch> index, while the
+                # binary-all / debian-installer/binary-all indexes are
+                # processed exactly once per component.
+                archs = [arch for arch in spec.arch.split(",") if arch]
                 for comp in spec.components:
                     d = spec.distribution
-                    process_index_spec(
-                        spec,
-                        f"dists/{d}/{comp}/binary-{spec.arch}/Packages",
-                        False,
-                    )
+                    for arch in archs:
+                        process_index_spec(
+                            spec,
+                            f"dists/{d}/{comp}/binary-{arch}/Packages",
+                            False,
+                        )
                     process_index_spec(
                         spec, f"dists/{d}/{comp}/binary-all/Packages", True
                     )
-                    process_index_spec(
-                        spec,
-                        f"dists/{d}/{comp}/debian-installer/"
-                        f"binary-{spec.arch}/Packages",
-                        True,
-                    )
+                    for arch in archs:
+                        process_index_spec(
+                            spec,
+                            f"dists/{d}/{comp}/debian-installer/binary-{arch}/Packages",
+                            True,
+                        )
                     process_index_spec(
                         spec,
                         f"dists/{d}/{comp}/debian-installer/binary-all/Packages",
@@ -2332,10 +2450,15 @@ def _mirror_run(configfile: str) -> int:
             mirror_path, sorted(config.clean), skipclean, tilde, plus
         )
         # The original opens (truncates) the cleanscript regardless of
-        # mode; in _autoclean mode it stays empty.
+        # mode; in _autoclean mode it stays empty.  Like the original's
+        # chmod +x (both modes), the script is executable either way — in
+        # _autoclean mode it is simply left empty (it is regenerated and
+        # used on the next non-autoclean run).
         try:
             cleanscript_path.parent.mkdir(parents=True, exist_ok=True)
-            cleanscript_path.touch()
+            with cleanscript_path.open("w", encoding="utf-8"):
+                pass
+            cleanscript_path.chmod(cleanscript_path.stat().st_mode | 0o111)
         except OSError:
             pass
         if _config_on(get_var(variables, "_autoclean")):

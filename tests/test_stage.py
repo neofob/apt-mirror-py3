@@ -4,6 +4,8 @@ Every network test talks to the in-process FixtureServer bound to
 127.0.0.1 (tests/conftest.py) — the external network is never touched.
 """
 
+import time
+
 from .conftest import FixtureServer
 
 
@@ -184,3 +186,41 @@ class TestCredentialLeak:
                 f"http://127.0.0.1:{port}/pool/b.deb",
             ]
         )
+
+
+class TestPerTransferPacing:
+    """limit_rate paces each TRANSFER separately (spec §5.3: per transfer,
+    matching per-wget-process semantics) — N concurrent transfers each run
+    at the full rate, not the aggregate/N rate of one shared limiter."""
+
+    def test_two_transfers_pace_independently(self, am, tmp_path) -> None:
+        size = 16 * 1024  # 16 KiB -> 8.192 s of pacing at 2000 B/s each
+        variables = {**am.DEFAULT_CONFIG, "nthreads": "2", "limit_rate": "2000"}
+        with FixtureServer() as srv:
+            for name in ("/two/a.deb", "/two/b.deb"):
+                srv.add(name, bytes((i * 13) % 256 for i in range(size)))
+            fetcher = am.Fetcher(variables, backoff_base=0.001)
+            started = time.monotonic()
+            result = am.download_stage(
+                "pace",
+                [srv.url("/two/a.deb"), srv.url("/two/b.deb")],
+                tmp_path / "root",
+                fetcher,
+                variables,
+                tmp_path / "var",
+            )
+            elapsed = time.monotonic() - started
+        assert result.ok == 2
+        # Margins (documented, like the TLS/timing pins):
+        # - Lower bound 8.0 s: at least the single-largest transfer's
+        #   8.192 s of pacing (minus 0.2 s slack) — the rate is honoured.
+        # - Upper bound 15.0 s: well under the 16.384 s a shared
+        #   aggregate limiter (or two sequential transfers) would take,
+        #   and ~6.8 s above the ideal 8.192 s concurrent bound, so a
+        #   loaded CI box has wide slack before this becomes flaky.
+        assert elapsed >= 8.0, f"too fast: {elapsed:.2f}s"
+        assert elapsed < 15.0, f"too slow: {elapsed:.2f}s"
+        port = srv.port
+        for name in ("/two/a.deb", "/two/b.deb"):
+            dest = tmp_path / "root" / f"127.0.0.1:{port}" / name.lstrip("/")
+            assert dest.stat().st_size == size

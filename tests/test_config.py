@@ -148,7 +148,10 @@ class TestParseConfig:
         config.write_text("set foo $undefined\n", encoding="utf-8")
         with pytest.raises(am.AptMirrorError) as excinfo:
             am.parse_config(config)
-        assert "undefined" in str(excinfo.value)
+        assert str(excinfo.value) == (
+            "apt-mirror: config file line 1: set foo $undefined: "
+            "reference to undefined variable 'undefined'"
+        )
 
     def test_reference_to_earlier_key_expands(self, am, tmp_path) -> None:
         config = tmp_path / "mirror.list"
@@ -163,8 +166,23 @@ class TestParseConfig:
     def test_self_referencing_set_is_error(self, am, tmp_path) -> None:
         config = tmp_path / "mirror.list"
         config.write_text("set a $a\n", encoding="utf-8")
-        with pytest.raises(am.AptMirrorError):
+        with pytest.raises(am.AptMirrorError) as excinfo:
             am.parse_config(config)
+        # ``a`` is not in the table while its own value is still expanding,
+        # so the self-reference surfaces as an undefined-variable error.
+        assert str(excinfo.value) == (
+            "apt-mirror: config file line 1: set a $a: "
+            "reference to undefined variable 'a'"
+        )
+
+    def test_non_converging_expansion_message_is_pinned(self, am) -> None:
+        variables = {"a": "$a $a"}
+        with pytest.raises(am.AptMirrorError) as excinfo:
+            am.get_var(variables, "a")
+        assert str(excinfo.value) == (
+            "apt-mirror: while expanding 'a': variable expansion does not "
+            f"converge (no stable value after {am.MAX_EXPANSION_PASSES} passes)"
+        )
 
     def test_missing_config_file_is_error(self, am, tmp_path) -> None:
         with pytest.raises(am.AptMirrorError):

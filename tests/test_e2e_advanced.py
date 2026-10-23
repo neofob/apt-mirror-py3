@@ -16,10 +16,19 @@ the coverage laid down in spec §5.5-5.11 and §7.1:
 10. flat repositories mirror without a ``dists/`` segment (spec §5.1)
 11. ``nthreads`` capped at the stage URL count
 12. an invalid ``limit_rate`` is a clean config error
+13. ``use_proxy 1`` tunnels https (CONNECT + Proxy-Authorization) and
+    forwards plain http (absolute-form) through an authenticated local
+    proxy (Review C2 — the ``set_tunnel`` TypeError regression)
+14. ``deb [arch=a,b]`` mirrors every architecture's pools and indexes
+    (Review C1 — the raw multi-arch interpolation regression)
+15. a non-UTF-8 config file is a clean, named error (no traceback)
+16. secondary by-hash paths are hardlinked for multi-hash-listed files
+    (spec §5.6.3 hash-variant dedupe)
 
 Every server is on 127.0.0.1 only: no external network.
 """
 
+import base64
 import fcntl
 import hashlib
 import os
@@ -30,6 +39,7 @@ from .conftest import (
     AUTH_PASSWORD,
     AUTH_USER,
     FixtureServer,
+    LocalProxy,
     build_fixture_repo,
     build_flat_repo,
     run_mirror,
@@ -113,6 +123,13 @@ def test_autoclean_frees_only_planted_content(tmp_path: Path) -> None:
         assert not (tree / "emptydir").exists()
         missing = live - _files(mirror)
         assert not missing, f"autoclean removed live files: {missing}"
+        # The original chmod +x's the script in BOTH modes (parity): in
+        # _autoclean mode it is left empty but still executable (it is
+        # regenerated and unused on the next non-autoclean run).
+        clean_sh = base / "var" / "clean.sh"
+        assert clean_sh.is_file()
+        assert os.access(clean_sh, os.X_OK)
+        assert clean_sh.read_text(encoding="utf-8") == ""
 
         # Pass 2: _autoclean 0 writes an executable clean.sh instead.
         plant()
@@ -593,3 +610,255 @@ def test_invalid_limit_rate_is_a_clean_error(tmp_path: Path) -> None:
     assert "limit_rate" in result.stderr
     assert "bananas" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def _flat_proxy_config(
+    base: Path, deb_url: str, proxy_url: str, no_check: str | None
+) -> Path:
+    """A single flat-repo config routed through the ``LocalProxy``."""
+    base.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"set base_path {base}",
+        "set defaultarch amd64",
+        "set nthreads 2",
+        "set limit_rate 100m",
+        "set run_postmirror 0",
+        "set _autoclean 0",
+        "set use_proxy 1",
+        f"set https_proxy {proxy_url}",
+        f"set http_proxy {proxy_url}",
+    ]
+    if no_check is not None:
+        lines.append(f"set no_check_certificate {no_check}")
+    lines.append(f"deb {deb_url} flat")
+    lines.append(f"clean {deb_url}")
+    config = base / "mirror.list"
+    config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return config
+
+
+def test_https_proxy_tunnel_sends_proxy_authorization(
+    https_server: FixtureServer, tmp_path: Path
+) -> None:
+    """Scenario 13a (Review C2): with ``use_proxy 1`` an https target must
+    CONNECT-tunnel through the proxy sending Proxy-Authorization — the
+    old ``set_tunnel(..., proxy_authorization=...)`` call is a TypeError
+    on every released CPython and killed the whole run."""
+    root = tmp_path / "fixture"
+    build_flat_repo(root, dist="flat", release=True, variant=0)
+    serve_subtree(https_server, root, "flat")
+    deb_url = https_server.url("/flat")
+    assert deb_url.startswith("https://")
+    with LocalProxy() as proxy:
+        base = tmp_path / "spool"
+        config = _flat_proxy_config(
+            base, deb_url, f"http://proxu:proxp@127.0.0.1:{proxy.port}", "1"
+        )
+        result = run_mirror(config)
+    assert result.returncode == 0, result.stdout + result.stderr
+    # Every file of the flat repo mirrored byte-for-byte (all through the
+    # tunnel — the origin only ever sees proxied traffic).
+    host = _host(deb_url)
+    tree = base / "mirror" / host / "flat"
+    assert (tree / "flat" / "Packages").read_bytes() == (
+        root / "flat" / "flat" / "Packages"
+    ).read_bytes()
+    assert (tree / "flat" / "Release").is_file()
+    deb = tree / "pool" / "f" / "fpkg" / "fpkg_1.0-1_amd64.deb"
+    assert (
+        deb.read_bytes()
+        == (root / "flat" / "pool" / "f" / "fpkg" / "fpkg_1.0-1_amd64.deb").read_bytes()
+    )
+    # The proxy saw CONNECT requests with the expected Basic token.
+    expected = "Basic " + base64.b64encode(b"proxu:proxp").decode("ascii")
+    assert proxy.requests, "no request reached the proxy at all"
+    assert all("127.0.0.1" in request and ":" in request for request in proxy.requests)
+    assert proxy.seen_auth.count(expected) == len(proxy.requests)
+
+
+def test_http_proxy_absolute_form_sends_proxy_authorization(
+    tmp_path: Path,
+) -> None:
+    """Scenario 13b (Review C2): a plain-http target goes to the proxy as
+    an absolute-form request carrying Proxy-Authorization (from the proxy
+    URL's userinfo) and the file mirrors end to end."""
+    root = tmp_path / "fixture"
+    build_flat_repo(root, dist="flat", release=True, variant=0)
+    origin = FixtureServer()
+    origin.__enter__()
+    serve_subtree(origin, root, "flat")
+    with LocalProxy() as proxy:
+        try:
+            base = tmp_path / "spool"
+            config = _flat_proxy_config(
+                base,
+                origin.url("/flat"),
+                f"http://proxu:proxp@127.0.0.1:{proxy.port}",
+                None,
+            )
+            result = run_mirror(config)
+        finally:
+            origin.__exit__(None, None, None)
+    assert result.returncode == 0, result.stdout + result.stderr
+    host = _host(origin.url("/flat"))
+    tree = base / "mirror" / host / "flat"
+    assert (tree / "flat" / "Packages").read_bytes() == (
+        root / "flat" / "flat" / "Packages"
+    ).read_bytes()
+    deb = tree / "pool" / "f" / "fpkg" / "fpkg_1.0-1_amd64.deb"
+    assert (
+        deb.read_bytes()
+        == (root / "flat" / "pool" / "f" / "fpkg" / "fpkg_1.0-1_amd64.deb").read_bytes()
+    )
+    # Every request arrived at the proxy in absolute form and carried the
+    # Basic token derived from the proxy URL's userinfo.
+    expected = "Basic " + base64.b64encode(b"proxu:proxp").decode("ascii")
+    assert proxy.requests, "no request reached the proxy at all"
+    assert all(request.startswith(f"http://{host}/flat") for request in proxy.requests)
+    assert proxy.seen_auth.count(expected) == len(proxy.requests)
+
+
+def test_multi_arch_deb_line_mirrors_every_arch(tmp_path: Path) -> None:
+    """Scenario 14 (Review C1): ``deb [arch=amd64,i386]`` mirrors BOTH
+    architectures' indexes and pool archives — stage 3 used to interpolate
+    the raw ``"amd64,i386"`` string into the index paths and skipped every
+    arch-specific Packages with a silent warning, so the i386 .deb never
+    reached the mirror."""
+    urls = build_fixture_repo(
+        tmp_path / "fixture",
+        insecure_repo=False,
+        unsigned_src_repo=False,
+        multi_arch=True,
+    )
+    try:
+        base = tmp_path / "spool"
+        base.mkdir(parents=True, exist_ok=True)
+        deb_line = f"deb [arch=amd64,i386] {urls['main']} dist main contrib"
+        config = base / "mirror.list"
+        config.write_text(
+            "\n".join(
+                [
+                    f"set base_path {base}",
+                    "set defaultarch amd64",
+                    "set nthreads 2",
+                    "set limit_rate 100m",
+                    "set run_postmirror 0",
+                    "set _autoclean 0",
+                    deb_line,
+                    f"clean {urls['main']}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = run_mirror(config)
+        assert result.returncode == 0, result.stdout + result.stderr
+        # Missing-index warnings may only concern the fixture's empty
+        # ``contrib`` component (listed in the Release, no files).  None may
+        # target main's per-arch indexes — the C1 regression was the raw
+        # "amd64,i386" spelling in the index path.
+        bad = [
+            line
+            for line in result.stderr.splitlines()
+            if "can't open index" in line and "/main/binary-" in line
+        ]
+        assert not bad, bad
+        assert "amd64,i386" not in result.stderr
+        assert "Processing indexes: [P]" in result.stdout
+        host = _host(urls["main"])
+        tree = base / "mirror" / host / "repo"
+        dist = tree / "dists" / "dist" / "main"
+        root_main = urls.root / "repo" / "dists" / "dist" / "main"
+        # Both arches' Packages indexes are in the tree, byte-identical.
+        assert (dist / "binary-amd64" / "Packages.gz").read_bytes() == (
+            root_main / "binary-amd64" / "Packages.gz"
+        ).read_bytes()
+        assert (dist / "binary-i386" / "Packages.gz").read_bytes() == (
+            root_main / "binary-i386" / "Packages.gz"
+        ).read_bytes()
+        assert (dist / "binary-all" / "Packages").is_file()
+        # Both arches' pool .debs byte-mirror the fixture.
+        assert (
+            tree / "pool" / "main" / "b" / "bar" / "bar_1.0-1_amd64.deb"
+        ).read_bytes() == (
+            urls.root / "repo" / "pool" / "main" / "b" / "bar" / "bar_1.0-1_amd64.deb"
+        ).read_bytes()
+        assert (
+            tree / "pool" / "main" / "m" / "multi" / "multi_1.0-1_i386.deb"
+        ).read_bytes() == (
+            urls.root
+            / "repo"
+            / "pool"
+            / "main"
+            / "m"
+            / "multi"
+            / "multi_1.0-1_i386.deb"
+        ).read_bytes()
+    finally:
+        _close(urls)
+
+
+def test_non_utf8_config_is_a_clean_named_error(tmp_path: Path) -> None:
+    """Scenario 15 (parked minor): a binary config file is a clean fatal
+    error naming the file (no UnicodeDecodeError traceback)."""
+    config = tmp_path / "badutf8.list"
+    config.write_bytes(b"set base_path x\nset nthreads f\xffoo\n")
+    result = run_mirror(config)
+    assert result.returncode != 0
+    assert "Traceback" not in result.stderr
+    assert str(config) in result.stderr
+    assert "not valid UTF-8" in result.stderr
+
+
+def test_secondary_by_hash_paths_are_hardlinked(tmp_path: Path) -> None:
+    """Scenario 16 (spec §5.6.3): the Perl's secondary canonical to
+    other-digest mapping (file_to_hashsums) is preserved — a by-hash file
+    listed under TWO OR MORE supported sections (the fixture Release lists
+    every file under all four, with real digests) ends up hardlinked at
+    the by-hash path of EVERY section it advertises, not just the
+    strongest one it is downloaded from."""
+    urls = build_fixture_repo(
+        tmp_path / "fixture", insecure_repo=False, unsigned_src_repo=False
+    )
+    try:
+        base = tmp_path / "spool"
+        config = write_config(base, {"main": urls["main"]})
+        result = run_mirror(config)
+        assert result.returncode == 0, result.stdout + result.stderr
+        pkgs_path = (
+            urls.root
+            / "repo"
+            / "dists"
+            / "dist"
+            / "main"
+            / "binary-amd64"
+            / "Packages.gz"
+        )
+        pkgs = pkgs_path.read_bytes()
+        dist = (
+            base
+            / "mirror"
+            / _host(urls["main"])
+            / "repo"
+            / "dists"
+            / "dist"
+            / "main"
+            / "binary-amd64"
+        )
+        digests = {
+            "sha512": hashlib.sha512(pkgs).hexdigest(),
+            "sha256": hashlib.sha256(pkgs).hexdigest(),
+            "sha1": hashlib.sha1(pkgs).hexdigest(),
+            "md5sum": hashlib.md5(pkgs).hexdigest(),
+        }
+        anchor = dist / "by-hash" / "sha512" / digests["sha512"]
+        assert anchor.is_file()
+        assert anchor.read_bytes() == pkgs
+        for name, digest in digests.items():
+            path = dist / "by-hash" / name / digest
+            assert path.is_file(), f"missing secondary by-hash path {name}"
+            assert path.read_bytes() == pkgs
+            # Hardlinked into the same inode as the downloaded sha512 copy.
+            assert path.stat().st_ino == anchor.stat().st_ino, name
+    finally:
+        _close(urls)

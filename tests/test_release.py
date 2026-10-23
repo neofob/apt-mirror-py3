@@ -21,6 +21,8 @@ from the original Perl ``find_metadata_in_release`` plus the spec §5.6 /
   ``source/``.
 """
 
+import logging
+
 import pytest
 
 # Distinct, well-formed digests for each of the four sections.
@@ -370,3 +372,135 @@ class TestKnownIndexUrls:
         urls = am.known_index_urls(spec)
         assert urls
         assert all(u.by_hash is None and u.by_hashsum is None for u in urls)
+
+
+class TestUnsupportedHashSection:
+    """A by-hash Release whose file is listed only under an UNSUPPORTED
+    section (spec §5.6.3: warn and fall back to canonical downloads)."""
+
+    def test_unsupported_section_still_records_the_file(self, am, tmp_path) -> None:
+        text = (
+            "Origin: Test\n"
+            "Acquire-By-Hash: yes\n"
+            "SHA384:\n"
+            f"  {'7' * 96} 1000 main/binary-amd64/Packages.gz\n"
+        )
+        path = write_release(tmp_path, text)
+        info = am.parse_release(path)
+        entries = info.entries["main/binary-amd64/Packages.gz"]
+        assert len(entries) == 1
+        assert entries[0].hashname == "SHA384"
+        assert entries[0].size == 1000
+
+    def test_unsupported_hash_warns_and_falls_back_to_canonical(
+        self, am, tmp_path, caplog
+    ) -> None:
+        text = (
+            "Origin: Test\n"
+            "Acquire-By-Hash: yes\n"
+            "SHA384:\n"
+            f"  {'7' * 96} 1000 main/binary-amd64/Packages.gz\n"
+        )
+        path = write_release(tmp_path, text)
+        info = am.parse_release(path)
+        spec = binary_spec(am, components=["main"])
+        with caplog.at_level(logging.WARNING, logger="apt-mirror"):
+            urls = am.index_urls_for(spec, info)
+        assert len(urls) == 1
+        # Canonical download: the by-hash fields stay None.
+        assert urls[0].filename == "main/binary-amd64/Packages.gz"
+        assert urls[0].by_hash is None
+        assert urls[0].by_hashsum is None
+        # And the warning names the file.
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        assert any(
+            "main/binary-amd64/Packages.gz" in warning for warning in warnings
+        ), warnings
+
+    def test_unsupported_hash_no_warning_when_by_hash_off(self, am, tmp_path, caplog):
+        # Without Acquire-By-Hash the canonical path is normal: no warning.
+        text = (
+            f"Origin: Test\nSHA384:\n  {'7' * 96} 1000 main/binary-amd64/Packages.gz\n"
+        )
+        path = write_release(tmp_path, text)
+        info = am.parse_release(path)
+        spec = binary_spec(am, components=["main"])
+        with caplog.at_level(logging.WARNING, logger="apt-mirror"):
+            urls = am.index_urls_for(spec, info)
+        assert len(urls) == 1
+        assert urls[0].by_hash is None
+        assert caplog.records == []
+
+
+class TestNonUtf8Release:
+    """Release bytes that are not valid UTF-8 never raise (they are read
+    with errors='replace' and parse like the damaged text they become)."""
+
+    def test_raw_byte_in_release_never_raises(self, am, tmp_path) -> None:
+        path = tmp_path / "InRelease"
+        path.write_bytes(
+            b"Origin: Test\n"
+            b"Acquire-By-Hash: yes\n"
+            b"SHA512:\n"
+            + b" "
+            + b"3" * 128
+            + b" 1000 main/binary-amd64/Packages.gz"
+            + b"\n\xff\xfe junk\n"
+        )
+        info = am.parse_release(path)  # must not raise
+        assert "main/binary-amd64/Packages.gz" in info.entries
+        assert info.by_hash is True
+
+
+class TestKnownBasePathsMultiArch:
+    """_known_base_paths iterates every ``arch=a,b`` entry (spec §5.1):
+    per-arch Contents/binary, but Contents-all/binary-all exactly once."""
+
+    def test_components_multi_arch(self, am) -> None:
+        spec = binary_spec(am, components=["main", "contrib"], arch="amd64,i386")
+        bases = set(am._known_base_paths(spec))
+        for comp in ("main", "contrib"):
+            assert f"dists/stable/{comp}/binary-amd64/Packages" in bases
+            assert f"dists/stable/{comp}/binary-i386/Packages" in bases
+            assert f"dists/stable/{comp}/binary-all/Packages" in bases
+            assert f"dists/stable/{comp}/Contents-amd64" in bases
+            assert f"dists/stable/{comp}/Contents-i386" in bases
+            assert f"dists/stable/{comp}/Contents-all" in bases
+        # Dist-root Contents are not per-component.
+        assert "dists/stable/Contents-amd64" in bases
+        assert "dists/stable/Contents-i386" in bases
+        assert "dists/stable/Contents-all" in bases
+        # No raw " amd64,i386" interpolation anywhere.
+        for base in bases:
+            assert ",i386" not in base and "amd64,i386" not in base
+
+    def test_flat_multi_arch(self, am) -> None:
+        spec = binary_spec(am, components=None, arch="amd64,i386")
+        bases = set(am._known_base_paths(spec))
+        assert bases == {
+            "stable/Packages",
+            "stable/Contents-amd64",
+            "stable/Contents-i386",
+            "stable/Contents-all",
+        }
+
+    def test_single_arch_order_unchanged(self, am) -> None:
+        spec = binary_spec(am, components=["main"])
+        assert am._known_base_paths(spec) == [
+            "dists/stable/main/binary-amd64/Packages",
+            "dists/stable/main/binary-all/Packages",
+            "dists/stable/main/Contents-amd64",
+            "dists/stable/main/Contents-all",
+            "dists/stable/Contents-amd64",
+            "dists/stable/Contents-all",
+        ]
+        flat = binary_spec(am, components=None)
+        assert am._known_base_paths(flat) == [
+            "stable/Packages",
+            "stable/Contents-amd64",
+            "stable/Contents-all",
+        ]

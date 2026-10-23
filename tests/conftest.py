@@ -11,6 +11,7 @@ import contextlib
 import email.utils
 import gzip
 import hashlib
+import http.client
 import importlib.util
 import posixpath
 import re
@@ -19,6 +20,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import urllib.parse
 from datetime import UTC
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -158,16 +160,25 @@ class _FixtureRequestHandler(BaseHTTPRequestHandler):
             start = int(match.group(1))
             if start < len(content):
                 range_end = len(content) - 1
+                with server.lock:
+                    # A misrange() override makes the 206 claim a different
+                    # start than the one actually served (buggy server).
+                    claimed = server._misrange.get(path, start)
                 self._reply(
                     entry,
                     206,
                     body=content[start:],
                     headers={
-                        "Content-Range": f"bytes {start}-{range_end}/{len(content)}",
+                        "Content-Range": f"bytes {claimed}-{range_end}/{len(content)}",
                         **extra,
                     },
                 )
                 return
+            # RFC 7233: a request that starts past the end of the
+            # representation is unsatisfiable — real servers answer 416,
+            # not 200, so the fixture does too.
+            self._reply(entry, 416, body=b"range not satisfiable")
+            return
         self._reply(entry, 200, body=content, headers=extra)
 
     def _not_modified(
@@ -234,6 +245,7 @@ class FixtureServer(ThreadingHTTPServer):
         self._flaky: dict[str, tuple[int, int]] = {}
         self._redirects: dict[str, tuple[int, str | None]] = {}
         self._drops: dict[str, int] = {}
+        self._misrange: dict[str, int] = {}
         self.required_auth: tuple[str, str] | None = None
         self.request_log: list[dict[str, object]] = []
         self.lock = threading.Lock()
@@ -290,6 +302,7 @@ class FixtureServer(ThreadingHTTPServer):
         """
         with self.lock:
             self._files.pop(path, None)
+            self._misrange.pop(path, None)
         self._drops.pop(path, None)
 
     def handle_error(self, request: object, client_address: tuple) -> None:
@@ -332,12 +345,157 @@ class FixtureServer(ThreadingHTTPServer):
         """Truncate every response to ``path`` after ``n_bytes`` and hang up."""
         self._drops[path] = n_bytes
 
+    def misrange(self, path: str, claimed_start: int) -> None:
+        """Answer ranged requests to ``path`` with a 206 whose
+        ``Content-Range`` claims ``claimed_start`` instead of the real one.
+
+        Emulates a buggy server for the mismatched-206 self-heal (the
+        fetch must discard its partial and re-request without Range).
+        """
+        self._misrange[path] = claimed_start
+
     def count(self, prefix: str) -> int:
         """Number of logged requests whose path starts with ``prefix``."""
         with self.lock:
             return sum(
                 1 for entry in self.request_log if str(entry["path"]).startswith(prefix)
             )
+
+
+class _LocalProxyHandler(BaseHTTPRequestHandler):
+    """Minimal forward-proxy requests: CONNECT tunnel and absolute GET."""
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        """Keep the test output free of per-request access logs."""
+
+    def _record(self) -> None:
+        proxy = cast(LocalProxy, self.server)
+        with proxy.lock:
+            proxy.requests.append(self.path)
+            proxy.seen_auth.append(self.headers.get("Proxy-Authorization"))
+
+    def _reply_502(self) -> None:
+        """Answer an un-forwardable request with an empty 502."""
+        self.send_response(502)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        self.close_connection = True
+
+    def do_CONNECT(self) -> None:
+        """Answer CONNECT with 200 and relay the tunnelled bytes both ways.
+
+        Blocks until both relay directions see EOF (the client closing its
+        tunnel), so the server does not close the socket prematurely.
+        """
+        self._record()
+        host, _, port_text = self.path.partition(":")
+        port = int(port_text) if port_text else 443
+        try:
+            upstream = socket.create_connection((host, port), timeout=10.0)
+        except OSError:
+            self._reply_502()
+            return
+        self.send_response_only(200)
+        self.end_headers()
+        self.close_connection = True
+
+        def relay(src: socket.socket, dst: socket.socket) -> None:
+            with contextlib.suppress(OSError):
+                while chunk := src.recv(65536):
+                    dst.sendall(chunk)
+                dst.shutdown(socket.SHUT_WR)
+
+        threads = [
+            threading.Thread(
+                target=relay, args=(self.connection, upstream), daemon=True
+            ),
+            threading.Thread(
+                target=relay, args=(upstream, self.connection), daemon=True
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        upstream.close()
+
+    def do_GET(self) -> None:
+        """Forward an absolute-form ``GET http://...`` and echo the response."""
+        self._record()
+        if not (self.path.startswith("http://") or self.path.startswith("https://")):
+            self._reply_502()
+            return
+        parsed = urllib.parse.urlsplit(self.path)
+        if not parsed.hostname:
+            self._reply_502()
+            return
+        port = parsed.port or 80
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        origin = http.client.HTTPConnection(parsed.hostname, port, timeout=10.0)
+        headers = {
+            name: value
+            for name, value in self.headers.items()
+            if name.lower() not in ("proxy-authorization", "connection", "host")
+        }
+        headers["Host"] = f"{parsed.hostname}:{port}"
+        origin.request("GET", target, headers=headers)
+        response = origin.getresponse()
+        body = response.read()
+        origin.close()
+        self.send_response(response.status)
+        for name, value in response.getheaders():
+            if name.lower() not in (
+                "transfer-encoding",
+                "content-length",
+                "connection",
+            ):
+                self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+
+class LocalProxy(ThreadingHTTPServer):
+    """A minimal HTTP forward proxy on 127.0.0.1 for the proxy-path tests.
+
+    Handles ``CONNECT host:port`` (the https tunnelling case) by relaying
+    raw bytes both ways, and absolute-form ``GET http://...`` (the plain
+    http case) by forwarding to the origin and echoing the response.
+    Every request line is appended to ``requests`` and the ``Proxy-
+    Authorization`` header seen (or None) per request to ``seen_auth`` —
+    the assertions the proxy tests make.  Use as a context manager.
+    """
+
+    daemon_threads = True
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), _LocalProxyHandler)
+        self.requests: list[str] = []
+        self.seen_auth: list[str | None] = []
+        self.lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def port(self) -> int:
+        """The ephemeral TCP port the proxy is listening on."""
+        return self.server_address[1]
+
+    def __enter__(self) -> Self:
+        self._thread = threading.Thread(target=self.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.shutdown()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        self.server_close()
+
+    def handle_error(self, request: object, client_address: tuple) -> None:
+        """Keep per-connection server-side errors out of the test output."""
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +628,12 @@ def _inrelease_text(release: str) -> str:
 
 
 def _build_main_repo(
-    root: Path, *, by_hash: bool, variant: int, weak_file: str | None = None
+    root: Path,
+    *,
+    by_hash: bool,
+    variant: int,
+    weak_file: str | None = None,
+    multi_arch: bool = False,
 ) -> None:
     """One dists-layout repo at ``<root>/repo``: distribution ``dist``,
     components main+contrib, arch amd64, Acquire-By-Hash when ``by_hash``,
@@ -480,6 +643,11 @@ def _build_main_repo(
     builds the spec §7.1 #2 regression fixture: the file is listed only
     under the Release's ``SHA1:`` section and its by-hash copy is
     published at ``<dir>/by-hash/sha1/<digest>`` instead of under sha512.
+
+    ``multi_arch`` additively also generates
+    ``main/binary-i386/Packages.gz`` with its own
+    ``pool/main/m/multi/multi_1.0-1_i386.deb`` (the spec §5.1 ``arch=a,b``
+    fixture: both arches served, both must be mirrored).
     """
     base = root / "repo"
     dist = base / "dists" / "dist"
@@ -499,6 +667,10 @@ def _build_main_repo(
             "foo_1.0-1.diff.gz", 1500
         ),
     }
+    if multi_arch:
+        pools["pool/main/m/multi/multi_1.0-1_i386.deb"] = _fake_pool_bytes(
+            "multi_1.0-1_i386.deb", 4500 + variant * step
+        )
     for rel, data in pools.items():
         _write(base / rel, data)
     bar = pools["pool/main/b/bar/bar_1.0-1_amd64.deb"]
@@ -536,6 +708,17 @@ def _build_main_repo(
             ).encode("ascii")
         ),
     }
+    if multi_arch:
+        multi_i386 = pools["pool/main/m/multi/multi_1.0-1_i386.deb"]
+        indexes["main/binary-i386/Packages.gz"] = _gzip_bytes(
+            _deb_block(
+                "multi",
+                "1.0-1",
+                "i386",
+                "pool/main/m/multi/multi_1.0-1_i386.deb",
+                multi_i386,
+            ).encode("ascii")
+        )
     weak_set = frozenset({weak_file}) if weak_file is not None else None
     algo_fns = {"sha1": hashlib.sha1, "sha512": hashlib.sha512}
     for rel, data in indexes.items():
@@ -657,6 +840,7 @@ def build_fixture_repo(
     insecure_repo: bool = True,
     flat_repo: bool = False,
     weak_hash_file: str | None = None,
+    multi_arch: bool = False,
     variant: int = 0,
     last_modified: float | None = None,
     server: FixtureServer | None = None,
@@ -679,7 +863,9 @@ def build_fixture_repo(
       ``weak_hash_file`` (a ``main``-repo index name) instead lists that
       one file under the Release's ``SHA1:`` section only and publishes
       its by-hash copy under ``sha1/`` (spec §7.1 #2 regression fixture,
-      Task 9);
+      Task 9); ``multi_arch`` additionally serves a second architecture:
+      ``main/binary-i386/Packages.gz`` plus its own
+      ``pool/main/m/multi/multi_1.0-1_i386.deb`` (spec §5.1 ``arch=a,b``);
     - ``insecure`` — ``<root>/insecure`` (only when ``insecure_repo``):
       Release only (no InRelease) with one tiny Packages;
     - ``nosrc``   — ``<root>/nosrc`` (only when ``unsigned_src_repo``):
@@ -701,7 +887,13 @@ def build_fixture_repo(
     """
     root.mkdir(parents=True, exist_ok=True)
     roles: dict[str, str] = {"main": "repo"}
-    _build_main_repo(root, by_hash=by_hash, variant=variant, weak_file=weak_hash_file)
+    _build_main_repo(
+        root,
+        by_hash=by_hash,
+        variant=variant,
+        weak_file=weak_hash_file,
+        multi_arch=multi_arch,
+    )
     if insecure_repo:
         _build_insecure_repo(root, variant=variant)
         roles["insecure"] = "insecure"

@@ -21,6 +21,11 @@ a clean script, and supports proxy, rate limiting, and
 ```
 apt-mirror-py/
 ├── apt-mirror.py   # Entire application: config parser, download engine, CLI
+├── apt-mirror      # The original Perl tool, kept as the behavioral reference
+├── mirror.list     # Example config (documented; ships with the tool)
+├── pyproject.toml  # Tooling config only (ruff line length, test deps)
+├── tests/          # pytest suite (127.0.0.1-only fixture mirror server)
+├── docs/           # Design spec and review docs
 └── AGENTS.md       # This file
 ```
 
@@ -45,6 +50,9 @@ Requirements:
   mapping, else `amd64`)
 - Writes are confined to `base_path` (default `/var/spool/apt-mirror`) and the
   config-specified mirror/skel/var paths
+- One exception to "no external commands": the user-supplied
+  `postmirror_script` is executed via subprocess (`subprocess.run`) when
+  `run_postmirror 1` — it is the operator's script, not tool behavior
 
 ## Code style — PEP 8 and project conventions
 

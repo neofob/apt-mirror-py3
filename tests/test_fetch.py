@@ -242,6 +242,101 @@ class TestRateLimiter:
         assert time.monotonic() - started < 0.2
 
 
+class TestStalePartResume:
+    """A complete (non-empty) dest outranks a stale <dest>.part left by an
+    interrupted re-download (spec §5.3: resume applies to a *partial* local
+    file; 416 self-heals by dropping the part and retrying cleanly)."""
+
+    def test_complete_dest_with_stale_part_uses_ims_and_removes_part(
+        self, am, tmp_path
+    ) -> None:
+        content = b"stable content"
+        with FixtureServer() as srv:
+            srv.add("/m.txt", content, last_modified=1000.0)
+            fetcher = am.Fetcher({"limit_rate": "100m"})
+            dest = tmp_path / "m.txt"
+            part = tmp_path / "m.txt.part"
+            assert fetcher.fetch(srv.url("/m.txt"), dest) == len(content)
+            mtime = dest.stat().st_mtime
+            # Plant a stale partial from a hypothetically interrupted run.
+            part.write_bytes(b"stale partial")
+            written = fetcher.fetch(srv.url("/m.txt"), dest)
+            assert written == 0
+            # The 304 path ran (no Range was sent), the part was removed,
+            # and dest is byte-identical with an untouched mtime.
+            requests = [e for e in srv.request_log if e["path"] == "/m.txt"]
+            check = requests[-1]
+            assert check["status"] == 304
+            assert "if-modified-since" in check["headers"]
+            assert "range" not in check["headers"]
+            assert not part.exists()
+            assert dest.read_bytes() == content
+            assert dest.stat().st_mtime == mtime
+
+    def test_part_without_dest_and_shrunk_file_416_self_heals(
+        self, am, tmp_path
+    ) -> None:
+        content = b"small new content"
+        with FixtureServer() as srv:
+            srv.add("/s.bin", content)
+            fetcher = am.Fetcher({"limit_rate": "100m"}, backoff_base=0.01)
+            dest = tmp_path / "s.bin"
+            part = tmp_path / "s.bin.part"
+            # A partial bigger than the (now smaller) server file.
+            part.write_bytes(b"0" * 100)
+            written = fetcher.fetch(srv.url("/s.bin"), dest)
+            assert written == len(content)
+            assert dest.read_bytes() == content
+            assert not part.exists()
+            # Attempt 1: Range -> 416; attempt 2: clean full GET.
+            got = [e for e in srv.request_log if e["path"] == "/s.bin"]
+            assert [e["status"] for e in got] == [416, 200]
+            assert "range" in got[0]["headers"]
+            assert "range" not in got[1]["headers"]
+
+    def test_grew_then_republished_is_not_a_hybrid(self, am, tmp_path) -> None:
+        old = b"old complete file content"
+        new = old + b" and even more appended content"
+        with FixtureServer() as srv:
+            srv.add("/g.bin", old, last_modified=1000.0)
+            fetcher = am.Fetcher({"limit_rate": "100m"}, backoff_base=0.01)
+            dest = tmp_path / "g.bin"
+            part = tmp_path / "g.bin.part"
+            assert fetcher.fetch(srv.url("/g.bin"), dest) == len(old)
+            # Stale partial + a server-side republish of LARGER content.
+            part.write_bytes(b"stale partial")
+            srv.add("/g.bin", new, last_modified=time.time() + 5.0)
+            written = fetcher.fetch(srv.url("/g.bin"), dest)
+            # The old code appended the new tail of the *new* file onto the
+            # stale partial and replaced dest with the corrupt hybrid.
+            assert written == len(new)
+            assert dest.read_bytes() == new
+            assert dest.read_bytes() != old + b"stale partial"
+            assert not part.exists()
+
+    def test_mismatched_206_content_range_discards_and_retries(
+        self, am, tmp_path
+    ) -> None:
+        content = bytes((i * 7) % 256 for i in range(200))
+        with FixtureServer() as srv:
+            srv.add("/big.bin", content)
+            fetcher = am.Fetcher({"limit_rate": "100m"}, backoff_base=0.01)
+            dest = tmp_path / "big.bin"
+            part = tmp_path / "big.bin.part"
+            part.write_bytes(content[:50])
+            # The buggy server's 206 claims the range starts at 60.
+            srv.misrange("/big.bin", 60)
+            written = fetcher.fetch(srv.url("/big.bin"), dest)
+            # Attempt 1: 206 mismatch -> drop the part; attempt 2: full GET.
+            assert written == len(content)
+            assert dest.read_bytes() == content
+            assert not part.exists()
+            got = [e for e in srv.request_log if e["path"] == "/big.bin"]
+            assert [e["status"] for e in got] == [206, 200]
+            assert "range" in got[0]["headers"]
+            assert "range" not in got[1]["headers"]
+
+
 class TestFetcherConfig:
     """Fetcher validates limit_rate at construction."""
 
