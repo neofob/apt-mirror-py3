@@ -12,6 +12,7 @@ from apt_mirror.config import (
     parse_rate,
 )
 from apt_mirror.errors import AptMirrorError
+from apt_mirror.fetch import Fetcher, FetchError, FetchNotFound, RateLimiter
 from apt_mirror.uri import remove_double_slashes, sanitise_uri
 from apt_mirror.util import copy_file, format_bytes, locked, round_number
 
@@ -19,7 +20,11 @@ __all__ = [
     "DEFAULT_CONFIG",
     "MAX_EXPANSION_PASSES",
     "AptMirrorError",
+    "FetchError",
+    "FetchNotFound",
+    "Fetcher",
     "ParsedConfig",
+    "RateLimiter",
     "Repo",
     "copy_file",
     "detect_defaultarch",

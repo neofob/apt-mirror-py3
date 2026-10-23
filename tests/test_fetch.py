@@ -364,6 +364,22 @@ class TestProxyConfig:
         # The invalid URL must not be echoed (it may carry secrets).
         assert "127.0.0.1" not in message
 
+    def test_proxy_port_error_does_not_echo_credentials(self, am) -> None:
+        """An invalid proxy URL with embedded credentials must name the
+        option but never echo the user:pass@ userinfo (credential
+        hygiene)."""
+        with pytest.raises(am.AptMirrorError) as excinfo:
+            am.Fetcher(
+                {
+                    "use_proxy": "on",
+                    "http_proxy": "http://secretx:secret@127.0.0.1:99999",
+                }
+            )
+        message = str(excinfo.value)
+        assert "http_proxy" in message
+        assert "secretx" not in message
+        assert "secret@127.0.0.1" not in message
+
     def test_well_formed_proxy_url_constructs(self, am) -> None:
         fetcher = am.Fetcher({"use_proxy": "on", "http_proxy": "http://127.0.0.1:8123"})
         assert fetcher._proxies["http"] == ("127.0.0.1", 8123, None)
