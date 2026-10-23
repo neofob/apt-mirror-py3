@@ -4,13 +4,14 @@ Guidance for AI coding agents (and human contributors) working in this repositor
 
 ## Project overview
 
-`apt-mirror-py` is a Python 3, single-file reimplementation of the classic
-Perl-based **apt-mirror** tool. It mirrors apt repositories (Packages,
-Sources, Release, `.deb` archives), manages a local skel directory, generates
-a clean script, and supports proxy, rate limiting, and
+`apt-mirror-py` is a Python 3 reimplementation of the classic Perl-based
+**apt-mirror** tool: a modular, stdlib-only Python package (`apt_mirror/`)
+with a thin `apt-mirror.py` entry shim. It mirrors apt repositories
+(Packages, Sources, Release, `.deb` archives), manages a local skel
+directory, generates a clean script, and supports proxy, rate limiting, and
 `.gz`/`.bz2`/`.xz` index handling.
 
-- **Entry point:** `apt-mirror.py` (CLI, self-contained single file)
+- **Entry point:** the root `apt-mirror.py` shim (CLI) over the `apt_mirror/` package
 - **Target platform:** Debian-based Linux (pure-stdlib in-process HTTP
   fetching; `dpkg` is optional, for `defaultarch` auto-detection; `fcntl`
   file locking)
@@ -20,19 +21,46 @@ a clean script, and supports proxy, rate limiting, and
 
 ```
 apt-mirror-py/
-├── apt-mirror.py   # Entire application: config parser, download engine, CLI
-├── apt-mirror      # The original Perl tool, kept as the behavioral reference
-├── mirror.list     # Example config (documented; ships with the tool)
-├── pyproject.toml  # Tooling config only (ruff line length, test deps)
-├── tests/          # pytest suite (127.0.0.1-only fixture mirror server)
-├── docs/           # Design spec and review docs
-└── AGENTS.md       # This file
+├── apt-mirror.py          # Entry shim (~6 lines) — keeps the CLI stable
+├── apt_mirror/            # The application (stdlib only)
+│   ├── __init__.py        # Package docstring (the usage text) + public API
+│   ├── errors.py          # AptMirrorError (dependency-free leaf module)
+│   ├── cli.py             # main(), argparse, --version
+│   ├── config.py          # Repo, ParsedConfig, parse_config(_line), $var
+│   │                      #   expansion, get_var, detect_defaultarch,
+│   │                      #   parse_rate, _config_on, DEFAULT_CONFIG,
+│   │                      #   MAX_EXPANSION_PASSES, _MACHINE_TO_ARCH
+│   ├── uri.py             # sanitise_uri, remove_double_slashes
+│   ├── util.py            # format_bytes, round_number, _strip_userinfo,
+│   │                      #   copy_file, locked (context manager)
+│   ├── fetch.py           # Fetcher, FetchError, FetchNotFound,
+│   │                      #   RateLimiter, _Target/_parse_target,
+│   │                      #   _TruncatedBodyError, _basic_token,
+│   │                      #   _build_tls_context/_build_proxy_table helpers
+│   ├── download.py        # StageResult, download_stage (+ worker)
+│   ├── release.py         # HashEntry, ReleaseInfo, IndexUrl,
+│   │                      #   parse_release, dist_base, index_urls_for,
+│   │                      #   known_index_urls, _known_base_paths,
+│   │                      #   HASH_STRENGTH, _RELEASE_NAMES
+│   ├── index.py           # PackageRec, iter_index_blocks, parse_index,
+│   │                      #   need_update, _INDEX_EXTENSIONS,
+│   │                      #   _INDEX_PARSE_ERRORS
+│   ├── clean.py           # Unneeded, collect_unneeded, write_cleanscript
+│   └── run.py             # AptMirror (orchestrator class),
+│                          #   ArchiveBookkeeping, run_postmirror
+├── tests/                 # Same files; conftest loader rewritten (below)
+├── apt-mirror             # Original Perl tool (behavioral reference)
+├── mirror.list, pyproject.toml, AGENTS.md, docs/
 ```
 
-The codebase is intentionally one file. Do **not** split it into modules, add
-a package directory, or introduce dependencies (e.g. `requests`, `urllib3`)
-without an explicit discussion — the single-file, stdlib-only design is a
-contribution goal (easy deployment on minimal servers).
+Module ownership: new index formats go in `index.py`/`release.py`;
+retry/timeouts/TLS changes go in `fetch.py`; config options in `config.py`;
+stage-flow changes in `run.py`; new fatal/user-facing exceptions in
+`errors.py`; network types in `fetch.py`. New modules are added only when a
+new responsibility appears, and must be documented in this file. Do **not**
+introduce third-party dependencies (e.g. `requests`, `urllib3`) — the
+stdlib-only design is still a contribution goal (easy deployment on minimal
+servers).
 
 ## Running the tool
 
@@ -58,6 +86,10 @@ Requirements:
 
 - Follow **PEP 8** (`ruff`-clean code). Target line length is 88 chars
   (configured in `pyproject.toml`).
+- Class architecture: the `AptMirror` orchestrator has one method per
+  stage, with `ArchiveBookkeeping` alongside in `run.py`; `Fetcher` lives
+  in `fetch.py`. Place new responsibilities per the module-ownership rule
+  above.
 - Type hints on function signatures (the codebase already uses them, e.g.
   `def get_var(variables: dict[str, str], key: str) -> str`). Keep new code
   consistent.
@@ -88,12 +120,12 @@ Dev tooling is separate from runtime dependencies:
 ```bash
 # Formatting / lint (CI and pre-commit)
 pip install ruff
-ruff format apt-mirror.py tests/
-ruff check apt-mirror.py tests/
+ruff format apt-mirror.py apt_mirror/ tests/
+ruff check apt-mirror.py apt_mirror/ tests/
 
 # Static type checking (no runtime deps)
 pip install mypy
-mypy --python-version 3.12 --strict apt-mirror.py   # aim warnings-free over time
+mypy --python-version 3.12 --strict apt_mirror/ apt-mirror.py   # aim warnings-free over time
 
 # Tests (test-only deps: pytest, trustme — see pyproject.toml)
 pip install pytest trustme
@@ -103,11 +135,16 @@ pytest
 ## Testing
 
 - Tests live in `tests/` (pytest layout: `tests/test_*.py`), do not pollute
-  the single-file entry point with test code.
+  the `apt_mirror/` package with test code.
+- The runtime import of the tool is `import apt_mirror`; the hyphenated
+  root `apt-mirror.py` is loaded only by the shim, via
+  `from apt_mirror.cli import main`. The unit-test `am` session fixture is
+  a plain `import apt_mirror` — the former `importlib` file-location hack
+  is gone.
 - Test-only dependencies are `pytest` and `trustme` (self-signed certs for
   the local HTTPS test server); they are declared in `pyproject.toml`
   (`[project.optional-dependencies].test`) and are never runtime deps —
-  `apt-mirror.py` must stay a single stdlib-only file.
+  the `apt_mirror/` package must stay stdlib-only.
 - Tests must **not** touch the network beyond `127.0.0.1`:
   - End-to-end tests run `apt-mirror.py` as a subprocess
     (`run_mirror` in `tests/conftest.py`) against a local `ThreadingHTTPServer`
@@ -173,10 +210,10 @@ pytest -q
 ## Definition of done (any change)
 
 1. `pytest -q` passes locally.
-2. `ruff format --check apt-mirror.py tests/` and
-   `ruff check apt-mirror.py tests/` pass.
-3. No new third-party runtime dependencies (`apt-mirror.py` stays a single
-   stdlib-only file; anything new belongs to the test rig).
+2. `ruff format --check apt-mirror.py apt_mirror/ tests/` and
+   `ruff check apt-mirror.py apt_mirror/ tests/` pass.
+3. No new third-party runtime dependencies (the `apt_mirror/` package is
+   one unit, stdlib-only; anything new belongs to the test rig).
 4. No external commands (no `wget` or shell-outs for fetching or
    decompression); downloads and rate limiting are in-process stdlib (pacing
    via the `limit_rate` config option); status output stays the pinned
