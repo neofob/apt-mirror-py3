@@ -960,7 +960,11 @@ def download_stage(
                 print(f"[{done}/{total}]")
 
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        for future in (pool.submit(worker) for _ in range(n_workers)):
+        # Submit every worker up front: awaiting a future while the
+        # generator expression is still being consumed would run the
+        # workers one at a time, not concurrently (spec §5.3).
+        futures = [pool.submit(worker) for _ in range(n_workers)]
+        for future in futures:
             future.result()
     print(f"End time: {time.strftime(_TIME_FORMAT, time.localtime())}")
 

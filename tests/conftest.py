@@ -15,6 +15,7 @@ import importlib.util
 import posixpath
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -227,7 +228,7 @@ class FixtureServer(ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self) -> None:
+    def __init__(self, tls: ssl.SSLContext | None = None) -> None:
         super().__init__(("127.0.0.1", 0), _FixtureRequestHandler)
         self._files: dict[str, tuple[bytes, float | None]] = {}
         self._flaky: dict[str, tuple[int, int]] = {}
@@ -237,6 +238,7 @@ class FixtureServer(ThreadingHTTPServer):
         self.request_log: list[dict[str, object]] = []
         self.lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self._tls = tls
 
     def __enter__(self) -> "FixtureServer":
         self._thread = threading.Thread(target=self.serve_forever, daemon=True)
@@ -254,9 +256,49 @@ class FixtureServer(ThreadingHTTPServer):
         """The ephemeral TCP port the server is listening on."""
         return self.server_address[1]
 
+    @property
+    def tls(self) -> ssl.SSLContext | None:
+        """The server-side TLS context, or None when serving plain HTTP."""
+        return self._tls
+
     def url(self, path: str) -> str:
-        """The absolute http://127.0.0.1 URL that serves ``path``."""
-        return f"http://127.0.0.1:{self.port}{path}"
+        """The absolute URL (http or https, matching the TLS mode) serving
+        ``path``."""
+        scheme = "https" if self._tls is not None else "http"
+        return f"{scheme}://127.0.0.1:{self.port}{path}"
+
+    def get_request(self) -> tuple[ssl.SSLSocket | socket.socket, tuple]:
+        """Accept and wrap one connection (server-side TLS when configured).
+
+        A handshake that fails (e.g. a client that does not trust this
+        certificate) raises TimeoutError so serve_forever's accept loop
+        swallows it and keeps serving, instead of dying on the OSError.
+        """
+        conn, addr = self.socket.accept()
+        if self._tls is not None:
+            try:
+                conn = self._tls.wrap_socket(conn, server_side=True)
+            except ssl.SSLError:
+                conn.close()
+                raise TimeoutError from None
+        return conn, addr
+
+    def remove(self, path: str) -> None:
+        """Stop serving ``path``; later requests to it are answered 404.
+
+        Used to exercise server-side file deletion between runs (Task 9).
+        """
+        with self.lock:
+            self._files.pop(path, None)
+        self._drops.pop(path, None)
+
+    def handle_error(self, request: object, client_address: tuple) -> None:
+        """Keep per-connection server-side errors out of the test output.
+
+        A client that aborts a TLS handshake or a download mid-stream
+        legitimately resets the connection; the rig asserts on observed
+        behaviour, and the default traceback dump would add noise.
+        """
 
     def add(
         self, path: str, content: bytes, last_modified: float | None = None
@@ -379,25 +421,38 @@ def _sources_block(
 
 
 def _release_text(
-    suite: str, components: str, entries: dict[str, bytes], by_hash: bool
+    suite: str,
+    components: str,
+    entries: dict[str, bytes],
+    by_hash: bool,
+    sha1_only: frozenset[str] | None = None,
 ) -> str:
     """A Release file listing every file of ``entries`` (dist-root-relative
     name -> the exact bytes served) under all four hash sections, each with
-    the real digest and real size computed with hashlib."""
+    the real digest and real size computed with hashlib.
+
+    ``sha1_only`` names the files listed **only** under the ``SHA1:``
+    section (omitted from SHA512/SHA256/MD5Sum): the weak-hash fixture for
+    the spec §7.1 #2 regression (Task 9).  An empty ``components`` skips
+    the Components header entirely (flat repositories).
+    """
     lines = [
         "Origin: Fixture",
         "Label: Fixture",
         f"Suite: {suite}",
         f"Codename: {suite}",
         "Architectures: amd64 all",
-        f"Components: {components}",
-        "Description: fixture repository generated for the test rig",
     ]
+    if components:
+        lines.append(f"Components: {components}")
+    lines.append("Description: fixture repository generated for the test rig")
     if by_hash:
         lines.append("Acquire-By-Hash: yes")
     for hashname in _HASH_FUNCS:
         lines.append(f"{hashname}:")
         for filename in sorted(entries):
+            if sha1_only is not None and filename in sha1_only and hashname != "SHA1":
+                continue
             data = entries[filename]
             digest = _HASH_FUNCS[hashname](data).hexdigest()
             lines.append(f"  {digest} {len(data)} {filename}")
@@ -414,10 +469,18 @@ def _inrelease_text(release: str) -> str:
     )
 
 
-def _build_main_repo(root: Path, *, by_hash: bool, variant: int) -> None:
+def _build_main_repo(
+    root: Path, *, by_hash: bool, variant: int, weak_file: str | None = None
+) -> None:
     """One dists-layout repo at ``<root>/repo``: distribution ``dist``,
     components main+contrib, arch amd64, Acquire-By-Hash when ``by_hash``,
-    and a pool holding the referenced archives."""
+    and a pool holding the referenced archives.
+
+    ``weak_file`` (a dist-root-relative index name, with ``by_hash`` on)
+    builds the spec §7.1 #2 regression fixture: the file is listed only
+    under the Release's ``SHA1:`` section and its by-hash copy is
+    published at ``<dir>/by-hash/sha1/<digest>`` instead of under sha512.
+    """
     base = root / "repo"
     dist = base / "dists" / "dist"
     step = 1024  # each variant grows every .deb by this many bytes
@@ -473,17 +536,21 @@ def _build_main_repo(root: Path, *, by_hash: bool, variant: int) -> None:
             ).encode("ascii")
         ),
     }
+    weak_set = frozenset({weak_file}) if weak_file is not None else None
+    algo_fns = {"sha1": hashlib.sha1, "sha512": hashlib.sha512}
     for rel, data in indexes.items():
         _write(dist / rel, data)
         if by_hash:
-            # Exactly the path IndexUrl.by_hash_path fetches: strongest
-            # advertised hash (every file lists all four sections, so
-            # sha512) of the file, as <dir>/by-hash/sha512/<hexdigest>.
-            hexdigest = hashlib.sha512(data).hexdigest()
-            _write(
-                dist / posixpath.dirname(rel) / "by-hash" / "sha512" / hexdigest, data
-            )
-    release = _release_text("dist", "main contrib", indexes, by_hash)
+            # Exactly the path IndexUrl.by_hash_path fetches: the strongest
+            # hash the file *itself* advertises in the Release.  Every file
+            # but the optional ``weak_file`` lists all four sections, so
+            # that strongest is sha512; the weak file lists only SHA1, so
+            # its by-hash copy lives under sha1/ (spec §7.1 #2 fixture).
+            weak = weak_file is not None and rel == weak_file
+            algo = "sha1" if weak else "sha512"
+            hexdigest = algo_fns[algo](data).hexdigest()
+            _write(dist / posixpath.dirname(rel) / "by-hash" / algo / hexdigest, data)
+    release = _release_text("dist", "main contrib", indexes, by_hash, weak_set)
     _write(dist / "Release", release.encode("ascii"))
     _write(dist / "InRelease", _inrelease_text(release).encode("ascii"))
     # There is no Release.gpg: its fetches 404 and must be tolerated.
@@ -527,6 +594,29 @@ def _build_nosrc_repo(root: Path) -> None:
     # Nothing else: no Release/InRelease/Release.gpg, no binary indexes.
 
 
+def build_flat_repo(root: Path, *, dist: str, release: bool, variant: int = 0) -> None:
+    """A flat repository (no ``dists/`` segment) at ``<root>/flat``
+    (spec §5.1: a deb line with no components).
+
+    Layout: ``<dist>/Packages`` (uncompressed, one .deb) and the pool file
+    at the repo root — so index URLs are ``<uri>/<dist>/...`` and archive
+    URLs ``<uri>/pool/...``.  No InRelease and no Release.gpg ever;
+    ``release`` additionally writes a plain (unsigned, non-by-hash)
+    ``<dist>/Release`` with the real digest/size of Packages.
+    """
+    base = root / "flat"
+    pool_rel = "pool/f/fpkg/fpkg_1.0-1_amd64.deb"
+    pkg = _fake_pool_bytes("fpkg_1.0-1_amd64.deb", 3500 + variant * 1024)
+    _write(base / pool_rel, pkg)
+    packages = _deb_block("fpkg", "1.0-1", "amd64", pool_rel, pkg).encode("ascii")
+    _write(base / dist / "Packages", packages)
+    if release:
+        _write(
+            base / dist / "Release",
+            _release_text(dist, "", {"Packages": packages}, False).encode("ascii"),
+        )
+
+
 class FixtureRepoUrls(dict):
     """The role -> repo base URL map returned by build_fixture_repo.
 
@@ -543,12 +633,30 @@ class FixtureRepoUrls(dict):
         self.server: FixtureServer | None = None
 
 
+def serve_subtree(
+    server: FixtureServer,
+    root: Path,
+    sub: str,
+    last_modified: float | None = None,
+) -> None:
+    """Add every file under ``root / sub`` to ``server`` (paths keyed
+    relative to ``root``) with ``last_modified`` pinned so
+    If-Modified-Since re-checks are deterministic."""
+    stamp = _FIXTURE_LAST_MODIFIED if last_modified is None else last_modified
+    for file_path in sorted((root / sub).rglob("*")):
+        if file_path.is_file():
+            rel = file_path.relative_to(root).as_posix()
+            server.add(f"/{rel}", file_path.read_bytes(), last_modified=stamp)
+
+
 def build_fixture_repo(
     root: Path,
     *,
     by_hash: bool = True,
     unsigned_src_repo: bool = True,
     insecure_repo: bool = True,
+    flat_repo: bool = False,
+    weak_hash_file: str | None = None,
     variant: int = 0,
     last_modified: float | None = None,
     server: FixtureServer | None = None,
@@ -568,10 +676,17 @@ def build_fixture_repo(
       ``main/Contents-amd64.gz``, ``main/i18n/Translation-en.gz`` and
       ``main/source/Sources.gz`` (1 source, 2 ``File:`` entries -> .dsc +
       .diff.gz), with by-hash copies wherever ``by_hash`` is on;
+      ``weak_hash_file`` (a ``main``-repo index name) instead lists that
+      one file under the Release's ``SHA1:`` section only and publishes
+      its by-hash copy under ``sha1/`` (spec §7.1 #2 regression fixture,
+      Task 9);
     - ``insecure`` — ``<root>/insecure`` (only when ``insecure_repo``):
       Release only (no InRelease) with one tiny Packages;
     - ``nosrc``   — ``<root>/nosrc`` (only when ``unsigned_src_repo``):
-      only raw ``dists/nosrc/main/source/Sources.gz`` plus its pool file.
+      only raw ``dists/nosrc/main/source/Sources.gz`` plus its pool file;
+    - ``flat``    — ``<root>/flat`` (only when ``flat_repo``): a flat
+      repository — ``flat/flat/Packages`` (uncompressed) plus its pool
+      file, no Release of any kind (see build_flat_repo).
 
     Every file is added to ``server`` (or to a freshly started server kept
     in ``FixtureRepoUrls.server``) with ``last_modified`` pinned to
@@ -586,23 +701,22 @@ def build_fixture_repo(
     """
     root.mkdir(parents=True, exist_ok=True)
     roles: dict[str, str] = {"main": "repo"}
-    _build_main_repo(root, by_hash=by_hash, variant=variant)
+    _build_main_repo(root, by_hash=by_hash, variant=variant, weak_file=weak_hash_file)
     if insecure_repo:
         _build_insecure_repo(root, variant=variant)
         roles["insecure"] = "insecure"
     if unsigned_src_repo:
         _build_nosrc_repo(root)
         roles["nosrc"] = "nosrc"
+    if flat_repo:
+        build_flat_repo(root, dist="flat", release=False, variant=variant)
+        roles["flat"] = "flat"
     if server is None:
         server = FixtureServer()
         # Outlive this function: the test closes it via FixtureRepoUrls.
         server.__enter__()
-    stamp = _FIXTURE_LAST_MODIFIED if last_modified is None else last_modified
     for sub in roles.values():
-        for file_path in sorted((root / sub).rglob("*")):
-            if file_path.is_file():
-                rel = file_path.relative_to(root).as_posix()
-                server.add(f"/{rel}", file_path.read_bytes(), last_modified=stamp)
+        serve_subtree(server, root, sub, last_modified)
     urls = FixtureRepoUrls()
     urls.root = root
     urls.server = server
@@ -629,6 +743,9 @@ _ROLE_DEB_LINES: dict[str, tuple[tuple[str, str, str], ...]] = {
     "main": (("deb", "dist", "main contrib"), ("deb-src", "dist", "main contrib")),
     "insecure": (("deb", "insecure", "main"),),
     "nosrc": (("deb-src", "nosrc", "main"),),
+    # The flat role writes a component-less deb line (flat repository,
+    # spec §5.1): an empty components string suppresses the field.
+    "flat": (("deb", "flat", ""),),
 }
 
 
@@ -663,7 +780,11 @@ def write_config(
     ]
     for role, url in urls.items():
         for kind, dist, comps in _ROLE_DEB_LINES.get(role, (("deb", role, "main"),)):
-            lines.append(f"{kind} {url} {dist} {comps}")
+            # A flat line carries no components (spec §5.1).
+            if comps:
+                lines.append(f"{kind} {url} {dist} {comps}")
+            else:
+                lines.append(f"{kind} {url} {dist}")
         lines.append(f"clean {url}")
     if extra:
         lines.extend(extra)
@@ -691,3 +812,47 @@ def run_mirror(config: Path) -> subprocess.CompletedProcess:
         timeout=120,
         cwd=REPO_ROOT,
     )
+
+
+#: The fixture Basic-auth credentials the authed_server fixture pins
+#: (Task 9.9, spec §5.3: credentials must never leak).
+AUTH_USER = "u"
+AUTH_PASSWORD = "s3cr3t"
+
+
+@pytest.fixture
+def https_server() -> FixtureServer:
+    """A TLS FixtureServer (server-side certificate from a trustme CA that
+    covers 127.0.0.1 but is not in the system trust store).
+
+    The tool's default (verifying) TLS context therefore refuses it, which
+    exercises the spec §5.3 TLS-failure path; ``no_check_certificate 1``
+    accepts it.  ``build_flat_repo`` + ``serve_subtree`` supply the
+    repository served over the TLS socket.
+    """
+    import trustme
+
+    ca = trustme.CA()
+    server_cert = ca.issue_cert("127.0.0.1", "localhost")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_cert.configure_cert(context)
+    server = FixtureServer(tls=context)
+    server.__enter__()
+    try:
+        yield server
+    finally:
+        server.__exit__(None, None, None)
+
+
+@pytest.fixture
+def authed_server() -> FixtureServer:
+    """A FixtureServer that answers 401 to every request unless it carries
+    the fixture Basic credentials (``require_auth``, Task 3) — the
+    credential-leak scenario server (Task 9.9)."""
+    server = FixtureServer()
+    server.__enter__()
+    server.require_auth(AUTH_USER, AUTH_PASSWORD)
+    try:
+        yield server
+    finally:
+        server.__exit__(None, None, None)
