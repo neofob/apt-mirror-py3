@@ -21,9 +21,9 @@ deb [arch=amd64] http://us.archive.ubuntu.com/ubuntu noble-security main restric
 deb [arch=amd64] http://us.archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
 deb [arch=amd64] http://us.archive.ubuntu.com/ubuntu noble-backports main restricted universe multiverse
 
-deb [arch=amd64]  http://ppa.launchpad.net/gluster/glusterfs-11/ubuntu noble main
-deb [arch=amd64] https://download.docker.com/linux/ubuntu noble stable
+#deb [arch=amd64]  http://ppa.launchpad.net/gluster/glusterfs-11/ubuntu noble main
+#deb [arch=amd64] https://download.docker.com/linux/ubuntu noble stable
 
 clean http://us.archive.ubuntu.com/ubuntu
-clean http://download.docker.com/linux/ubuntu
-clean http://ppa.launchpad.net/gluster/glusterfs-11/ubuntu
+#clean http://download.docker.com/linux/ubuntu
+#clean http://ppa.launchpad.net/gluster/glusterfs-11/ubuntu
