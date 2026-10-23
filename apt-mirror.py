@@ -27,8 +27,6 @@ import base64
 import bz2
 import contextlib
 import email.utils
-import fcntl
-import filecmp
 import gzip
 import http.client
 import logging
@@ -38,7 +36,6 @@ import platform
 import posixpath
 import queue
 import re
-import shutil
 import ssl
 import subprocess
 import sys
@@ -48,9 +45,32 @@ import urllib.parse
 import zlib
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+
+from apt_mirror.errors import AptMirrorError
+from apt_mirror.uri import remove_double_slashes, sanitise_uri
+from apt_mirror.util import (
+    _quoted_path,
+    _strip_userinfo,
+    copy_file,
+    format_bytes,
+    locked,
+    round_number,
+)
+
+#: Re-exports from ``apt_mirror`` that keep this module's test interface
+#: (tests load it as the ``aptmirror`` module) stable; mirror
+#: ``apt_mirror/__init__``.
+__all__ = [
+    "AptMirrorError",
+    "copy_file",
+    "format_bytes",
+    "locked",
+    "remove_double_slashes",
+    "round_number",
+    "sanitise_uri",
+]
 
 logger = logging.getLogger("apt-mirror")
 
@@ -99,10 +119,6 @@ DEFAULT_CONFIG: dict[str, str] = {
     "_plus": "0",
     "_contents": "1",
 }
-
-
-class AptMirrorError(Exception):
-    """Fatal apt-mirror error; ``str(e)`` is the full user-facing message."""
 
 
 @dataclass(frozen=True)
@@ -210,89 +226,6 @@ def get_var(variables: dict[str, str], key: str) -> str:
     return _expand_template(variables[key], variables, f"while expanding '{key}'")
 
 
-# Path/URL normalisation for the mirror tree (spec §5.4).  Each ``_RDS_*``
-# pattern is applied, in order, to completion before the next one runs.
-_RDS_DOT = re.compile(r"/\./")  # ``/./`` -> ``/`` (redundant ``.`` component)
-_RDS_SLASH = re.compile(r"(?<!:)//")  # ``//`` -> ``/`` (never across ``://``)
-_RDS_DOTDOT = re.compile(r"(?<!:/)/[^/]+/\.\./")  # ``/seg/../`` -> ``/``
-_RDS_PATTERNS = (_RDS_DOT, _RDS_SLASH, _RDS_DOTDOT)
-
-
-def sanitise_uri(url: str, tilde: bool = False, plus: bool = False) -> str:
-    """Turn a URL into a mirror-tree directory key.
-
-    Strips the ``scheme://`` prefix and, when the host segment carries an
-    ``@``, the leading ``userinfo@`` part; applies the ``_tilde`` / ``_plus``
-    percent-encodings (``~`` -> ``%7E``, ``+`` -> ``%2B``) when requested; and
-    removes a single trailing ``/``.  Ports the original Perl ``sanitise_uri``
-    with identical observable behaviour (spec §5.4).
-    """
-    uri = re.sub(r"^[A-Za-z0-9_]+://", "", url)
-    if "@" in uri.split("/", 1)[0]:
-        uri = re.sub(r"^[^@]*@", "", uri, count=1)
-    if tilde:
-        uri = uri.replace("~", "%7E")
-    if plus:
-        uri = uri.replace("+", "%2B")
-    uri = uri.removesuffix("/")
-    return uri
-
-
-def remove_double_slashes(path: str, tilde: bool = False, plus: bool = False) -> str:
-    """Normalise a path inside the mirror tree.
-
-    Repeatedly collapses ``/./`` to ``/``, ``//`` to ``/`` (never across
-    ``://``), and ``/<segment>/../`` to ``/`` (never across ``:``), applying
-    the three rules in that fixed order and each to a fixpoint; then applies
-    the ``_tilde`` / ``_plus`` percent-encodings.  Ports the original Perl
-    ``remove_double_slashes`` with identical observable behaviour (spec §5.4).
-    """
-    result = path
-    for pattern in _RDS_PATTERNS:
-        result, changed = pattern.subn("/", result)
-        while changed:
-            result, changed = pattern.subn("/", result)
-    if tilde:
-        result = result.replace("~", "%7E")
-    if plus:
-        result = result.replace("+", "%2B")
-    return result
-
-
-def round_number(x: float) -> str:
-    """Round ``x`` to one decimal (ties round up) and format as a string.
-
-    Mirrors the original Perl ``round_number``: the magnitude is rounded to
-    the nearest tenth and the result is always rendered with at least one
-    decimal digit (whole numbers gain ``.0``).  The sign is preserved.
-    """
-    minus = "-" if x < 0 else ""
-    tenths = int((abs(x) + 0.05) * 10)
-    whole, frac = divmod(tenths, 10)
-    if frac:
-        return f"{minus}{whole}.{frac}"
-    return f"{minus}{whole}.0"
-
-
-def format_bytes(n: int) -> str:
-    """Format a byte count as a human-readable size string.
-
-    Below 1024 the value renders as ``<n> bytes``; otherwise the largest
-    binary unit (KiB / MiB / GiB, all 1024-based) divides it and the quotient
-    is rendered with ``round_number``.  Ports the original Perl
-    ``format_bytes``.
-    """
-    if n < 1024:
-        return f"{n} bytes"
-    if n >= 1024 * 1024 * 1024:
-        value, unit = n / (1024 * 1024 * 1024), "GiB"
-    elif n >= 1024 * 1024:
-        value, unit = n / (1024 * 1024), "MiB"
-    else:
-        value, unit = n / 1024, "KiB"
-    return f"{round_number(value)} {unit}"
-
-
 _RATE_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*([kKmMgG]?)\s*$")
 _RATE_MULTIPLIERS: dict[str, float] = {
     "k": 1_000.0,
@@ -336,13 +269,6 @@ _MAX_ATTEMPTS = 5
 
 #: Socket timeout, in seconds, applied to every connection.
 _SOCKET_TIMEOUT = 30.0
-
-_USERINFO_RE = re.compile(r"(?<=://)[^@/]*@")
-
-
-def _strip_userinfo(url: str) -> str:
-    """Remove a ``user[:password]@`` prefix from a URL, if present."""
-    return _USERINFO_RE.sub("", url, count=1)
 
 
 def _config_on(value: str | None) -> bool:
@@ -1761,52 +1687,6 @@ def parse_index(path: Path, tree_prefix: str) -> list[PackageRec]:
 # ---------------------------------------------------------------------------
 
 
-def _quoted_path(path: str) -> str:
-    """A path single-quoted for POSIX sh, with ``'`` escaped as ``'\\''``.
-
-    Ports the original's ``quoted_path`` so the generated cleanup script
-    survives any character in the mirror paths.
-    """
-    return "'" + path.replace("'", "'\\''") + "'"
-
-
-def copy_file(from_p: Path, to_p: Path, unlink_repl: bool) -> None:
-    """Copy (preferring a hardlink) ``from_p`` to ``to_p`` (spec §5.8).
-
-    Skips entirely when ``from_p`` is missing (parents are not created);
-    creates the destination's parent directories; when the destination
-    already matches the source's ``(st_size, st_mtime_ns)``, skips (the
-    common unchanged case); when ``unlink_repl`` (the ``unlink`` config
-    option) is set and the destination's content differs, deletes it
-    first; hardlinks when possible and falls back to a copy for the
-    cross-device case; and finally restores the source's atime/mtime onto
-    the destination.  A failed copy is a warning, not a fatal error (like
-    the original ``copy_file``).
-    """
-    if not from_p.is_file():
-        return
-    to_p.parent.mkdir(parents=True, exist_ok=True)
-    from_stat = from_p.stat()
-    if to_p.is_file():
-        to_stat = to_p.stat()
-        if (from_stat.st_size, from_stat.st_mtime_ns) == (
-            to_stat.st_size,
-            to_stat.st_mtime_ns,
-        ):
-            return
-        if unlink_repl and not filecmp.cmp(str(from_p), str(to_p), shallow=False):
-            to_p.unlink(missing_ok=True)
-    try:
-        try:
-            os.link(from_p, to_p)
-        except OSError:
-            shutil.copy2(from_p, to_p)
-    except OSError as error:
-        logger.warning("apt-mirror: can't copy %s to %s: %s", from_p, to_p, error)
-        return
-    os.utime(to_p, ns=(from_stat.st_atime_ns, from_stat.st_mtime_ns))
-
-
 @dataclass
 class Unneeded:
     """The files/directories the cleanup removes (spec §5.9).
@@ -1961,32 +1841,6 @@ def write_cleanscript(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     mode = path.stat().st_mode
     path.chmod(mode | 0o111)
-
-
-@contextmanager
-def locked(var_path: Path) -> Iterator[None]:
-    """Hold an exclusive non-blocking ``flock`` on
-    ``<var_path>/apt-mirror.lock`` (spec §5.2).
-
-    On acquisition failure raises AptMirrorError with the original's
-    exact message (the lock file is left in place); on success the lock
-    is released and the lock file removed on exit — so a stale
-    (holderless) lock file left by a crash is simply re-acquired and does
-    not survive the next clean exit.
-    """
-    lock_file = var_path / "apt-mirror.lock"
-    fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as error:
-        os.close(fd)
-        raise AptMirrorError("apt-mirror is already running, exiting") from error
-    try:
-        yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-        lock_file.unlink(missing_ok=True)
 
 
 def run_postmirror(variables: dict[str, str]) -> None:
