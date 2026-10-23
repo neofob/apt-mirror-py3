@@ -1315,14 +1315,17 @@ def _alternation(names: list[str]) -> str:
 def _index_patterns(spec: Repo) -> list[re.Pattern[str]]:
     """Whole-filename patterns selecting spec's index files (spec §5.6.2).
 
-    Built verbatim from the original's pattern sets, anchored and whole-
-    string matched (re.fullmatch): per-component and dist-root Contents,
+    Built from the original's pattern sets, anchored and whole-string
+    matched (re.fullmatch): per-component and dist-root Contents,
     ``binary-<arch|all>/Packages`` + ``Release``, cnf, dep11, i18n for
     binary repos; ``source/Sources``, ``source/Release`` and
     ``Contents-source`` for source repos; flat-repo variants mirror only
-    the single root ``Packages``/``Sources``.
+    the single root ``Packages``/``Sources``.  The compression extension
+    is optional: a Release may list an uncompressed index filename
+    (``.../Packages``), and the stage-2/3 pipeline handles those like any
+    other skel index (spec §5.7 opens the uncompressed file as-is).
     """
-    ext = _RELEASE_EXT_RE
+    ext = r"(?:" + _RELEASE_EXT_RE + ")?"
     if spec.components is None:
         names = ("Sources" + ext,) if spec.type == "deb-src" else ("Packages" + ext,)
         return [re.compile(name) for name in names]
@@ -2051,15 +2054,22 @@ def _mirror_run(configfile: str) -> int:
             """The ReleaseInfo of a non-empty, parseable Release file, or
             None when the copy is missing, empty, or unparseable (spec
             §7.1 fix #4 — a truncated Release must not survive the
-            validity check)."""
+            validity check).  parse_release never raises: it collects
+            warnings and simply stops when the fragment runs out of
+            checksum sections, so a truncated fragment (e.g. 10 leftover
+            bytes) parses to zero entries — and a release that names no
+            file at all is corrupt, not valid."""
             if not path.is_file():
                 return None
             try:
                 if path.stat().st_size == 0:
                     return None
-                return parse_release(path)
+                info = parse_release(path)
             except (OSError, UnicodeDecodeError, ValueError):
                 return None
+            if not info.entries:
+                return None
+            return info
 
         def spec_release_info(spec: Repo) -> ReleaseInfo | None:
             """The usable InRelease (else Release) of ``spec``.

@@ -9,9 +9,14 @@ tests in the suite talk to (127.0.0.1 only).
 import base64
 import contextlib
 import email.utils
+import gzip
+import hashlib
 import importlib.util
+import posixpath
 import re
 import socket
+import subprocess
+import sys
 import threading
 from datetime import UTC
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -291,3 +296,398 @@ class FixtureServer(ThreadingHTTPServer):
             return sum(
                 1 for entry in self.request_log if str(entry["path"]).startswith(prefix)
             )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end fixture repo (Tasks 8-9, spec §6 test rig)
+# ---------------------------------------------------------------------------
+
+#: The repository root (the directory holding ``apt-mirror.py``); the cwd
+#: every ``run_mirror`` subprocess is started in.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+#: The fixed Last-Modified served for every fixture file by default.  It is a
+#: date in the past, so an If-Modified-Since re-check whose local mtime is a
+#: real (later) wall-clock download time sees the server copy as unmodified
+#: and gets a 304 — the idempotency scenarios rely on exactly that.
+_FIXTURE_LAST_MODIFIED = 1_750_000_000.0
+
+_HASH_FUNCS = {
+    "SHA512": hashlib.sha512,
+    "SHA256": hashlib.sha256,
+    "SHA1": hashlib.sha1,
+    "MD5Sum": hashlib.md5,
+}
+
+
+def _write(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path``, creating parent directories as needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def _fake_pool_bytes(label: str, size: int) -> bytes:
+    """Deterministic pool-file bytes of exactly ``size`` bytes."""
+    head = f"FAKEARCHIVE {label} {size}\n".encode("ascii")
+    assert size > len(head)
+    body = bytearray()
+    counter = 0
+    while len(body) < size - len(head):
+        body += f"{counter:08d}\n".encode("ascii")
+        counter += 1
+    return head + bytes(body[: size - len(head)])
+
+
+def _gzip_bytes(data: bytes) -> bytes:
+    """Gzip ``data`` deterministically (mtime pinned to 0)."""
+    return gzip.compress(data, mtime=0)
+
+
+def _deb_block(name: str, version: str, arch: str, filename: str, data: bytes) -> str:
+    """One Packages-index block for an archive ``data`` at ``filename``."""
+    return (
+        f"Package: {name}\n"
+        f"Version: {version}\n"
+        f"Architecture: {arch}\n"
+        "Maintainer: Fixture <fixture@example.invalid>\n"
+        f"Filename: {filename}\n"
+        f"Size: {len(data)}\n"
+        f"MD5sum: {hashlib.md5(data).hexdigest()}\n"
+        f"SHA1: {hashlib.sha1(data).hexdigest()}\n"
+        f"SHA256: {hashlib.sha256(data).hexdigest()}\n"
+        "Description: fixture archive generated for the test rig\n"
+    )
+
+
+def _sources_block(
+    package: str, version: str, directory: str, files: list[tuple[str, bytes]]
+) -> str:
+    """One Sources-index block; each ``File:`` line carries the file's real
+    MD5, real size, and filename (relative to ``directory``)."""
+    lines = [
+        f"Package: {package}",
+        f"Binary: {package}",
+        f"Version: {version}",
+        "Architecture: all",
+        "Maintainer: Fixture <fixture@example.invalid>",
+        f"Directory: {directory}",
+        "Files:",
+    ]
+    for filename, data in files:
+        lines.append(f" {hashlib.md5(data).hexdigest()} {len(data)} {filename}")
+    return "\n".join(lines) + "\n"
+
+
+def _release_text(
+    suite: str, components: str, entries: dict[str, bytes], by_hash: bool
+) -> str:
+    """A Release file listing every file of ``entries`` (dist-root-relative
+    name -> the exact bytes served) under all four hash sections, each with
+    the real digest and real size computed with hashlib."""
+    lines = [
+        "Origin: Fixture",
+        "Label: Fixture",
+        f"Suite: {suite}",
+        f"Codename: {suite}",
+        "Architectures: amd64 all",
+        f"Components: {components}",
+        "Description: fixture repository generated for the test rig",
+    ]
+    if by_hash:
+        lines.append("Acquire-By-Hash: yes")
+    for hashname in _HASH_FUNCS:
+        lines.append(f"{hashname}:")
+        for filename in sorted(entries):
+            data = entries[filename]
+            digest = _HASH_FUNCS[hashname](data).hexdigest()
+            lines.append(f"  {digest} {len(data)} {filename}")
+    return "\n".join(lines) + "\n"
+
+
+def _inrelease_text(release: str) -> str:
+    """An InRelease: the Release text plus a fake (never verified) signature."""
+    return release + (
+        "\n-----BEGIN PGP SIGNATURE-----\n"
+        "iQFA fixture signature block; intentionally never verified by the\n"
+        "tool, which only parses checksum sections out of this file.\n"
+        "-----END PGP SIGNATURE-----\n"
+    )
+
+
+def _build_main_repo(root: Path, *, by_hash: bool, variant: int) -> None:
+    """One dists-layout repo at ``<root>/repo``: distribution ``dist``,
+    components main+contrib, arch amd64, Acquire-By-Hash when ``by_hash``,
+    and a pool holding the referenced archives."""
+    base = root / "repo"
+    dist = base / "dists" / "dist"
+    step = 1024  # each variant grows every .deb by this many bytes
+    pools: dict[str, bytes] = {
+        "pool/main/b/bar/bar_1.0-1_amd64.deb": _fake_pool_bytes(
+            "bar_1.0-1_amd64.deb", 5000 + variant * step
+        ),
+        "pool/main/f/foo/foo_1.0-1_amd64.deb": _fake_pool_bytes(
+            "foo_1.0-1_amd64.deb", 6000 + variant * step
+        ),
+        "pool/all/h/hello/hello_2.0-1_all.deb": _fake_pool_bytes(
+            "hello_2.0-1_all.deb", 4000 + variant * step
+        ),
+        "pool/main/f/foo/foo_1.0-1.dsc": _fake_pool_bytes("foo_1.0-1.dsc", 700),
+        "pool/main/f/foo/foo_1.0-1.diff.gz": _fake_pool_bytes(
+            "foo_1.0-1.diff.gz", 1500
+        ),
+    }
+    for rel, data in pools.items():
+        _write(base / rel, data)
+    bar = pools["pool/main/b/bar/bar_1.0-1_amd64.deb"]
+    foo = pools["pool/main/f/foo/foo_1.0-1_amd64.deb"]
+    hello = pools["pool/all/h/hello/hello_2.0-1_all.deb"]
+    dsc = pools["pool/main/f/foo/foo_1.0-1.dsc"]
+    diff = pools["pool/main/f/foo/foo_1.0-1.diff.gz"]
+    indexes: dict[str, bytes] = {
+        "main/binary-amd64/Packages.gz": _gzip_bytes(
+            (
+                _deb_block(
+                    "bar", "1.0-1", "amd64", "pool/main/b/bar/bar_1.0-1_amd64.deb", bar
+                )
+                # Index blocks are blank-line separated.
+                + "\n"
+                + _deb_block(
+                    "foo", "1.0-1", "amd64", "pool/main/f/foo/foo_1.0-1_amd64.deb", foo
+                )
+            ).encode("ascii")
+        ),
+        # Deliberately uncompressed (exercises suffix-less index handling).
+        "main/binary-all/Packages": _deb_block(
+            "hello", "2.0-1", "all", "pool/all/h/hello/hello_2.0-1_all.deb", hello
+        ).encode("ascii"),
+        "main/Contents-amd64.gz": _gzip_bytes(b"/usr/bin/bar bar\n/usr/bin/foo foo\n"),
+        "main/i18n/Translation-en.gz": _gzip_bytes(
+            b"Package: foo\nVersion: 1.0-1\nDescription-en: fixture package\n"
+        ),
+        "main/source/Sources.gz": _gzip_bytes(
+            _sources_block(
+                "foo",
+                "1.0-1",
+                "pool/main/f/foo",
+                [("foo_1.0-1.dsc", dsc), ("foo_1.0-1.diff.gz", diff)],
+            ).encode("ascii")
+        ),
+    }
+    for rel, data in indexes.items():
+        _write(dist / rel, data)
+        if by_hash:
+            # Exactly the path IndexUrl.by_hash_path fetches: strongest
+            # advertised hash (every file lists all four sections, so
+            # sha512) of the file, as <dir>/by-hash/sha512/<hexdigest>.
+            hexdigest = hashlib.sha512(data).hexdigest()
+            _write(
+                dist / posixpath.dirname(rel) / "by-hash" / "sha512" / hexdigest, data
+            )
+    release = _release_text("dist", "main contrib", indexes, by_hash)
+    _write(dist / "Release", release.encode("ascii"))
+    _write(dist / "InRelease", _inrelease_text(release).encode("ascii"))
+    # There is no Release.gpg: its fetches 404 and must be tolerated.
+
+
+def _build_insecure_repo(root: Path, *, variant: int) -> None:
+    """A Release-only (unsigned, never Acquire-By-Hash) repo at
+    ``<root>/insecure``: distribution ``insecure``, one tiny Packages."""
+    base = root / "insecure"
+    dist = base / "dists" / "insecure"
+    img = _fake_pool_bytes("img_1.0-1_amd64.deb", 4500 + variant * 1024)
+    _write(base / "pool" / "main" / "i" / "img" / "img_1.0-1_amd64.deb", img)
+    packages = _deb_block(
+        "img", "1.0-1", "amd64", "pool/main/i/img/img_1.0-1_amd64.deb", img
+    ).encode("ascii")
+    _write(dist / "main" / "binary-amd64" / "Packages", packages)
+    _write(
+        dist / "Release",
+        _release_text(
+            "insecure", "main", {"main/binary-amd64/Packages": packages}, False
+        ).encode("ascii"),
+    )
+    # No InRelease and no Release.gpg: the stage-1 InRelease fetch 404s and
+    # the stage-2 release lookup must fall back to this Release.
+
+
+def _build_nosrc_repo(root: Path) -> None:
+    """A source-only, unsigned repo at ``<root>/nosrc``: it carries only raw
+    ``dists/nosrc/main/source/Sources*`` — no Release at all, exercising the
+    well-known unsigned-source fallback."""
+    base = root / "nosrc"
+    dsc = _fake_pool_bytes("nosrc_1.0-1.dsc", 650)
+    _write(base / "pool" / "main" / "n" / "nosrc" / "nosrc_1.0-1.dsc", dsc)
+    sources = _sources_block(
+        "nosrc", "1.0-1", "pool/main/n/nosrc", [("nosrc_1.0-1.dsc", dsc)]
+    ).encode("ascii")
+    _write(
+        base / "dists" / "nosrc" / "main" / "source" / "Sources.gz",
+        _gzip_bytes(sources),
+    )
+    # Nothing else: no Release/InRelease/Release.gpg, no binary indexes.
+
+
+class FixtureRepoUrls(dict):
+    """The role -> repo base URL map returned by build_fixture_repo.
+
+    Besides mapping roles (``"main"``, ``"insecure"``, ``"nosrc"``) to their
+    ``http://127.0.0.1:<port>/<subpath>`` base URLs it carries the
+    ``server`` (the FixtureServer serving the repos, for request counting
+    and in-place rebuilds) and ``root`` (the on-disk tree, for reading the
+    exact bytes that are on the wire).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.root: Path | None = None
+        self.server: FixtureServer | None = None
+
+
+def build_fixture_repo(
+    root: Path,
+    *,
+    by_hash: bool = True,
+    unsigned_src_repo: bool = True,
+    insecure_repo: bool = True,
+    variant: int = 0,
+    last_modified: float | None = None,
+    server: FixtureServer | None = None,
+) -> FixtureRepoUrls:
+    """Generate synthetic Debian-style apt repos under ``root`` and serve
+    them from a FixtureServer on 127.0.0.1.
+
+    Layout (every generated index/Release lists the real sizes and real
+    digests of the generated bytes):
+
+    - ``main``    — ``<root>/repo``, dists layout, distribution ``dist``,
+      components main+contrib, arch amd64; Release with all four hash
+      sections and ``Acquire-By-Hash: yes`` when ``by_hash``, InRelease =
+      Release plus a fake signature, no Release.gpg; indexes
+      ``main/binary-amd64/Packages.gz`` (2 .debs),
+      ``main/binary-all/Packages`` (uncompressed, 1 all-arch .deb),
+      ``main/Contents-amd64.gz``, ``main/i18n/Translation-en.gz`` and
+      ``main/source/Sources.gz`` (1 source, 2 ``File:`` entries -> .dsc +
+      .diff.gz), with by-hash copies wherever ``by_hash`` is on;
+    - ``insecure`` — ``<root>/insecure`` (only when ``insecure_repo``):
+      Release only (no InRelease) with one tiny Packages;
+    - ``nosrc``   — ``<root>/nosrc`` (only when ``unsigned_src_repo``):
+      only raw ``dists/nosrc/main/source/Sources.gz`` plus its pool file.
+
+    Every file is added to ``server`` (or to a freshly started server kept
+    in ``FixtureRepoUrls.server``) with ``last_modified`` pinned to
+    ``last_modified`` (default: a fixed past date — see
+    _FIXTURE_LAST_MODIFIED) so If-Modified-Since behaviour is
+    deterministic.  ``variant`` > 0 regrows the .deb files (same paths,
+    bigger content) for simulating a server-side update; ``server``
+    re-adds every generated file onto an existing server (same port) —
+    combined with a fresh, later ``last_modified`` that forces
+    re-fetches.  Returns the role -> base URL map, e.g.
+    ``{"main": "http://127.0.0.1:<port>/repo", ...}``.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    roles: dict[str, str] = {"main": "repo"}
+    _build_main_repo(root, by_hash=by_hash, variant=variant)
+    if insecure_repo:
+        _build_insecure_repo(root, variant=variant)
+        roles["insecure"] = "insecure"
+    if unsigned_src_repo:
+        _build_nosrc_repo(root)
+        roles["nosrc"] = "nosrc"
+    if server is None:
+        server = FixtureServer()
+        # Outlive this function: the test closes it via FixtureRepoUrls.
+        server.__enter__()
+    stamp = _FIXTURE_LAST_MODIFIED if last_modified is None else last_modified
+    for sub in roles.values():
+        for file_path in sorted((root / sub).rglob("*")):
+            if file_path.is_file():
+                rel = file_path.relative_to(root).as_posix()
+                server.add(f"/{rel}", file_path.read_bytes(), last_modified=stamp)
+    urls = FixtureRepoUrls()
+    urls.root = root
+    urls.server = server
+    for role, sub in roles.items():
+        urls[role] = f"http://127.0.0.1:{server.port}/{sub}"
+    return urls
+
+
+@pytest.fixture
+def fixture_repo(tmp_path: Path) -> FixtureRepoUrls:
+    """A build_fixture_repo with all defaults, its server closed after the test."""
+    urls = build_fixture_repo(tmp_path / "fixture")
+    try:
+        yield urls
+    finally:
+        assert urls.server is not None
+        urls.server.__exit__(None, None, None)
+
+
+#: The deb/deb-src line (distribution, components) written by
+#: ``write_config`` for each fixture role; an unknown role gets a bare
+#: ``deb <uri> <role> main``.
+_ROLE_DEB_LINES: dict[str, tuple[tuple[str, str, str], ...]] = {
+    "main": (("deb", "dist", "main contrib"), ("deb-src", "dist", "main contrib")),
+    "insecure": (("deb", "insecure", "main"),),
+    "nosrc": (("deb-src", "nosrc", "main"),),
+}
+
+
+def write_config(
+    base: Path,
+    urls: dict[str, str],
+    *,
+    autoclean: str = "0",
+    extra: list[str] | None = None,
+) -> Path:
+    """Write ``base/mirror.list`` mirroring the fixture roles in ``urls``.
+
+    The config pins ``base_path -> base``, ``nthreads 2``, ``limit_rate
+    100m`` and ``run_postmirror 0``; writes one deb (and, for the main
+    role, also a deb-src) line per role plus a ``clean`` line per base URL;
+    and installs an executable ``postmirror.sh`` under ``base/var`` that
+    records its working directory in ``base/var/pwd.txt`` (the Task 9
+    postmirror check; harmless while run_postmirror is off).  ``extra``
+    config lines are appended last so they may override earlier values.
+    Returns the config path.
+    """
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "var").mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# generated by write_config (test rig)",
+        f"set base_path {base}",
+        "set defaultarch amd64",
+        "set nthreads 2",
+        "set limit_rate 100m",
+        "set run_postmirror 0",
+        f"set _autoclean {autoclean}",
+    ]
+    for role, url in urls.items():
+        for kind, dist, comps in _ROLE_DEB_LINES.get(role, (("deb", role, "main"),)):
+            lines.append(f"{kind} {url} {dist} {comps}")
+        lines.append(f"clean {url}")
+    if extra:
+        lines.extend(extra)
+    config = base / "mirror.list"
+    config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    script = base / "var" / "postmirror.sh"
+    script.write_text(
+        f"#!/bin/sh\npwd > {base / 'var' / 'pwd.txt'}\n", encoding="utf-8"
+    )
+    script.chmod(0o755)
+    return config
+
+
+def run_mirror(config: Path) -> subprocess.CompletedProcess:
+    """Run the real tool as a subprocess against ``config`` and wait.
+
+    Uses the current interpreter and the repository root as the working
+    directory, so the bare ``apt-mirror.py`` path resolves; raises
+    subprocess.TimeoutExpired after 120 s.
+    """
+    return subprocess.run(
+        [sys.executable, "apt-mirror.py", str(config)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=REPO_ROOT,
+    )
