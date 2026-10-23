@@ -11,6 +11,7 @@ from apt_mirror.config import (
     parse_config_line,
     parse_rate,
 )
+from apt_mirror.download import StageResult, download_stage
 from apt_mirror.errors import AptMirrorError
 from apt_mirror.fetch import Fetcher, FetchError, FetchNotFound, RateLimiter
 from apt_mirror.index import (
@@ -46,10 +47,12 @@ __all__ = [
     "RateLimiter",
     "ReleaseInfo",
     "Repo",
+    "StageResult",
     "_known_base_paths",
     "copy_file",
     "detect_defaultarch",
     "dist_base",
+    "download_stage",
     "format_bytes",
     "get_var",
     "index_urls_for",
