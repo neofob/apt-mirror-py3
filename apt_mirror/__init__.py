@@ -1,5 +1,6 @@
 """The apt-mirror package; the public API is re-exported from its submodules."""
 
+from apt_mirror.clean import Unneeded, collect_unneeded, write_cleanscript
 from apt_mirror.config import (
     DEFAULT_CONFIG,
     MAX_EXPANSION_PASSES,
@@ -48,7 +49,9 @@ __all__ = [
     "ReleaseInfo",
     "Repo",
     "StageResult",
+    "Unneeded",
     "_known_base_paths",
+    "collect_unneeded",
     "copy_file",
     "detect_defaultarch",
     "dist_base",
@@ -68,4 +71,5 @@ __all__ = [
     "remove_double_slashes",
     "round_number",
     "sanitise_uri",
+    "write_cleanscript",
 ]
