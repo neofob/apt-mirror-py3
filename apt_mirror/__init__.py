@@ -13,6 +13,12 @@ from apt_mirror.config import (
 )
 from apt_mirror.errors import AptMirrorError
 from apt_mirror.fetch import Fetcher, FetchError, FetchNotFound, RateLimiter
+from apt_mirror.index import (
+    PackageRec,
+    iter_index_blocks,
+    need_update,
+    parse_index,
+)
 from apt_mirror.release import (
     HashEntry,
     IndexUrl,
@@ -35,6 +41,7 @@ __all__ = [
     "Fetcher",
     "HashEntry",
     "IndexUrl",
+    "PackageRec",
     "ParsedConfig",
     "RateLimiter",
     "ReleaseInfo",
@@ -46,10 +53,13 @@ __all__ = [
     "format_bytes",
     "get_var",
     "index_urls_for",
+    "iter_index_blocks",
     "known_index_urls",
     "locked",
+    "need_update",
     "parse_config",
     "parse_config_line",
+    "parse_index",
     "parse_rate",
     "parse_release",
     "remove_double_slashes",
