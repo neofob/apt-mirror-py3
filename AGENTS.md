@@ -164,14 +164,14 @@ pytest -q
 ### CI/CD
 
 - Every push to the default branch and every PR must pass:
-  1. `ruff format --check` and `ruff check` (over `apt-mirror.py` and `tests/`)
+  1. `ruff format --check` and `ruff check` (over `apt-mirror.py`, `apt_mirror/`, and `tests/`)
   2. `pytest`
 - The workflow should run on the matrix Python `3.12` and `3.13` (latest) on
   `ubuntu-latest`.
 - Releases: tag with `vX.Y.Z` semantic versioning; a release workflow publishes
-  a tarball. The tool ships as a single file — the "package" is `apt-mirror.py`
-  plus `mirror.list` examples; consider also packaging with
-  `python3-apt-mirror` naming for Debian.
+  a tarball. The tool ships as `apt-mirror.py` (shim) plus the
+  `apt_mirror/` package and `mirror.list` examples; consider also packaging
+  with `python3-apt-mirror` naming for Debian.
 
 ### Deployment & operations
 
