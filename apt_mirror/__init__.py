@@ -1,6 +1,28 @@
-"""The apt-mirror package; the public API is re-exported from its submodules."""
+"""apt-mirror for Python: mirror apt repositories in pure stdlib Python 3.
+
+A clean reimplementation of the classic Perl apt-mirror.  It mirrors apt
+repositories (release, index and archive files) into a local mirror tree,
+manages the skel and mirror directories, and generates a cleanup script.
+It has no third-party runtime dependencies and no external tool
+requirements: fetching and decompression happen in-process.
+
+Usage:
+    apt-mirror.py [configfile]
+
+Without an argument the tool uses /etc/apt/mirror.list.  The config file
+is line-oriented:
+
+    set <key> [<value>]        set a config variable (value may be quoted)
+    deb <uri> <dist> <comps>   mirror a binary repository
+    deb-src <uri> <dist> ...   mirror a source repository
+    clean <uri>                directory key the cleanup covers
+    skip-clean <uri>           directory key excluded from the cleanup
+
+``#`` comment lines and blank lines are ignored.
+"""
 
 from apt_mirror.clean import Unneeded, collect_unneeded, write_cleanscript
+from apt_mirror.cli import main
 from apt_mirror.config import (
     DEFAULT_CONFIG,
     MAX_EXPANSION_PASSES,
@@ -65,6 +87,7 @@ __all__ = [
     "iter_index_blocks",
     "known_index_urls",
     "locked",
+    "main",
     "need_update",
     "parse_config",
     "parse_config_line",
