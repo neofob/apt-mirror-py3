@@ -4,14 +4,17 @@ Guidance for AI coding agents (and human contributors) working in this repositor
 
 ## Project overview
 
-`apt-mirror-py` is a Python 3, single-file port of the classic Perl-based
-**apt-mirror** tool. It mirrors apt repositories (Packages, Sources, Release,
-`.deb` archives), manages a local skel directory, generates a clean script,
-and supports proxy, rate limiting, and `.gz`/`.bz2`/`.xz` index handling.
+`apt-mirror-py` is a Python 3, single-file reimplementation of the classic
+Perl-based **apt-mirror** tool. It mirrors apt repositories (Packages,
+Sources, Release, `.deb` archives), manages a local skel directory, generates
+a clean script, and supports proxy, rate limiting, and
+`.gz`/`.bz2`/`.xz` index handling.
 
-- **Entry point:** `apt-mirror.py` (CLI, stdlib-only)
-- **Target platform:** Debian-based Linux (uses `dpkg`, `wget`, `fcntl` file locking)
-- **Python:** 3.9+ (3.10+ recommended; stdlib only — no third-party dependencies)
+- **Entry point:** `apt-mirror.py` (CLI, self-contained single file)
+- **Target platform:** Debian-based Linux (pure-stdlib in-process HTTP
+  fetching; `dpkg` is optional, for `defaultarch` auto-detection; `fcntl`
+  file locking)
+- **Python:** 3.12+ (stdlib only — no third-party runtime dependencies)
 
 ## Repository layout
 
@@ -37,27 +40,36 @@ python3 apt-mirror.py /etc/apt/mirror.list
 ```
 
 Requirements:
-- `wget` on `PATH` (downloads are delegated to `wget` via `subprocess`)
-- `dpkg` for architecture detection (falls back to `amd64` if absent)
+- Pure stdlib; no external commands required (`dpkg` is optional, for
+  `defaultarch` auto-detection — it falls back to a `platform.machine()`
+  mapping, else `amd64`)
 - Writes are confined to `base_path` (default `/var/spool/apt-mirror`) and the
   config-specified mirror/skel/var paths
 
 ## Code style — PEP 8 and project conventions
 
-- Follow **PEP 8** (`pep8`/`ruff` clean code). Target line length is 88 chars.
+- Follow **PEP 8** (`ruff`-clean code). Target line length is 88 chars
+  (configured in `pyproject.toml`).
 - Type hints on function signatures (the codebase already uses them, e.g.
-  `def get_var(self, name: str) -> str`). Keep new code consistent.
+  `def get_var(variables: dict[str, str], key: str) -> str`). Keep new code
+  consistent.
 - Use **double quotes** for strings (existing convention).
 - Naming: `snake_case` for functions/variables, `PascalCase` for classes,
-  `UPPER_SNAKE_CASE` for module-level constants (e.g. `COMPRESSION_MODULES`).
+  `UPPER_SNAKE_CASE` for module-level constants (e.g. `MAX_EXPANSION_PASSES`).
 - Docstrings: one-line summary followed by a blank line and details
   (Sphinx-compatible, triple-quoted double quotes).
-- Logging: use the module `logger` (`logging.getLogger("apt-mirror")`).
-  **Never** call `print()` for status output; **never** use `logging.basicConfig`
-  again (it is configured once at import time).
-- Error handling: raise `ValueError`/`FileNotFoundError` with descriptive
-  messages prefixed `apt-mirror:` on user-facing config errors; avoid bare
-  `except:` — catch the specific exception (the codebase already does).
+- Output: status lines go to **stdout** via `print()` — the fixed,
+  single-line, machine-parseable strings pinned by the design spec §5.11
+  (e.g. `Downloading <N> files using <M> threads...`,
+  `Processing metadata files from releases [M...M]`,
+  `Processing indexes: [SPS...SPS]`, the cleaning summary). Warnings and
+  user-facing errors go to **stderr**: the module `logger`
+  (`logging.getLogger("apt-mirror")`) for warnings, `print(...,
+  file=sys.stderr)` for fatal `apt-mirror:`-prefixed errors. Do not configure
+  logging (no `logging.basicConfig`); keep every message single-line.
+- Error handling: raise `AptMirrorError` with a descriptive message prefixed
+  `apt-mirror:` on user-facing config errors; avoid bare `except:` — catch
+  the specific exception (the codebase already does).
 - Filesystem access: use `pathlib.Path`; always resolve relative to the
   config, never hardcode paths.
 
@@ -68,15 +80,15 @@ Dev tooling is separate from runtime dependencies:
 ```bash
 # Formatting / lint (CI and pre-commit)
 pip install ruff
-ruff format apt-mirror.py
-ruff check --select E,W,F,I,UP,B,SIM apt-mirror.py
+ruff format apt-mirror.py tests/
+ruff check apt-mirror.py tests/
 
 # Static type checking (no runtime deps)
 pip install mypy
-mypy --python-version 3.10 --strict apt-mirror.py   # aim warnings-free over time
+mypy --python-version 3.12 --strict apt-mirror.py   # aim warnings-free over time
 
-# Tests
-pip install pytest
+# Tests (test-only deps: pytest, trustme — see pyproject.toml)
+pip install pytest trustme
 pytest
 ```
 
@@ -84,11 +96,17 @@ pytest
 
 - Tests live in `tests/` (pytest layout: `tests/test_*.py`), do not pollute
   the single-file entry point with test code.
-- Tests must **not** perform real network downloads:
-  - Monkeypatch `AptMirror.download_archive`, or fake a mirror under
-    `tmp_path` (pytest fixture) and point the config `base_path` there.
-  - Test pure logic directly: `get_var`, `_remove_double_slashes`,
-    `_sanitise_uri`, `format_bytes`, config parsing.
+- Test-only dependencies are `pytest` and `trustme` (self-signed certs for
+  the local HTTPS test server); they are declared in `pyproject.toml`
+  (`[project.optional-dependencies].test`) and are never runtime deps —
+  `apt-mirror.py` must stay a single stdlib-only file.
+- Tests must **not** touch the network beyond `127.0.0.1`:
+  - End-to-end tests run `apt-mirror.py` as a subprocess
+    (`run_mirror` in `tests/conftest.py`) against a local `ThreadingHTTPServer`
+    fixture repo under `tmp_path`, with the config `base_path` pointed there.
+  - Unit tests exercise the pure logic directly: config parsing and `$var`
+    expansion, `sanitise_uri`, `remove_double_slashes`, Release-file parsing,
+    `format_bytes`, rate-limiter pacing, the clean-script writer.
 - Every bug fix and new feature requires a regression test.
 - Run the full test suite before considering any change complete:
 
@@ -101,10 +119,10 @@ pytest -q
 ### CI/CD
 
 - Every push to the default branch and every PR must pass:
-  1. `ruff format --check` and `ruff check`
+  1. `ruff format --check` and `ruff check` (over `apt-mirror.py` and `tests/`)
   2. `pytest`
-- The workflow should run on the matrix Python `3.9`, `3.10`, `3.11`, `3.12`
-  and `3.13` (latest) on `ubuntu-latest`.
+- The workflow should run on the matrix Python `3.12` and `3.13` (latest) on
+  `ubuntu-latest`.
 - Releases: tag with `vX.Y.Z` semantic versioning; a release workflow publishes
   a tarball. The tool ships as a single file — the "package" is `apt-mirror.py`
   plus `mirror.list` examples; consider also packaging with
@@ -113,16 +131,21 @@ pytest -q
 ### Deployment & operations
 
 - **Idempotency:** running the tool twice must be safe (it skips unchanged
-  files via `stat` + `filecmp`). Do not add state that breaks this.
-- **Locking:** the tool acquires an exclusive `fcntl.flock` on the spool
-  directory (`lock_file`). Do not launch it concurrently from cron without
-  relying on that lock.
-- **Log format:** `%(message)s` line-oriented output, designed for log
-  collectors. Keep single-line messages; never log raw config contents that
-  may include `proxy_password` / `private_key`.
+  files via `If-Modified-Since`/304 and size checks, `stat` + `filecmp`, and
+  downloads atomically via temp-file + rename). Do not add state that breaks
+  this.
+- **Locking:** the tool takes an exclusive non-blocking `fcntl.flock` on
+  `<var_path>/apt-mirror.lock` and exits "already running" if it is held.
+  Do not launch it concurrently from cron without relying on that lock.
+- **Output format:** line-oriented, designed for log collectors — fixed
+  single-line `print()` status lines on stdout (spec §5.11) and single-line
+  warnings on stderr. Keep messages single-line; never output or log raw
+  config contents that may include `proxy_user` / `proxy_password` or embedded
+  origin credentials.
 - **Security:**
-  - Credentials in config (`proxy_user`, `proxy_password`) must never appear
-    in logs, error messages, or exception output.
+  - Credentials in config (`proxy_user`, `proxy_password`, or embedded
+    `user:pass@` URLs) must never appear in stdout, stderr, error messages, or
+    exception output.
   - TLS verification: the `no_check_certificate` config option exists for
     compatibility — document it as insecure when enabling.
 - **cron usage (typical):**
@@ -142,8 +165,14 @@ pytest -q
 ## Definition of done (any change)
 
 1. `pytest -q` passes locally.
-2. `ruff format --check` and `ruff check` pass.
-3. No new third-party runtime dependencies.
-4. No `print()`, no `time.sleep` for pacing (use rate limiting via `wget`),
-   no hardcoded absolute paths outside config defaults.
-5. Behavior verified against a real or fixture mirror config where feasible.
+2. `ruff format --check apt-mirror.py tests/` and
+   `ruff check apt-mirror.py tests/` pass.
+3. No new third-party runtime dependencies (`apt-mirror.py` stays a single
+   stdlib-only file; anything new belongs to the test rig).
+4. No external commands (no `wget` or shell-outs for fetching or
+   decompression); downloads and rate limiting are in-process stdlib (pacing
+   via the `limit_rate` config option); status output stays the pinned
+   single-line `print()` lines of spec §5.11; no hardcoded absolute paths
+   outside config defaults.
+5. Behavior verified against the fixture mirror config (a local `127.0.0.1`
+   server) where feasible.

@@ -136,7 +136,11 @@ def test_autoclean_frees_only_planted_content(tmp_path: Path) -> None:
 
         # Execute the generated script: same deletion result, "done." out.
         sh_out = subprocess.run(
-            ["sh", str(clean_sh)], capture_output=True, text=True, timeout=30
+            ["sh", str(clean_sh)],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
         )
         assert sh_out.returncode == 0, sh_out.stdout + sh_out.stderr
         assert "done." in sh_out.stdout

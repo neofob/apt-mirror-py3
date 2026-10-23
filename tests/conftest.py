@@ -23,7 +23,7 @@ from datetime import UTC
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType
-from typing import Any, cast
+from typing import Any, Self, cast
 
 import pytest
 
@@ -240,7 +240,7 @@ class FixtureServer(ThreadingHTTPServer):
         self._thread: threading.Thread | None = None
         self._tls = tls
 
-    def __enter__(self) -> "FixtureServer":
+    def __enter__(self) -> Self:
         self._thread = threading.Thread(target=self.serve_forever, daemon=True)
         self._thread.start()
         return self
@@ -448,13 +448,13 @@ def _release_text(
     lines.append("Description: fixture repository generated for the test rig")
     if by_hash:
         lines.append("Acquire-By-Hash: yes")
-    for hashname in _HASH_FUNCS:
+    for hashname, hash_func in _HASH_FUNCS.items():
         lines.append(f"{hashname}:")
         for filename in sorted(entries):
             if sha1_only is not None and filename in sha1_only and hashname != "SHA1":
                 continue
             data = entries[filename]
-            digest = _HASH_FUNCS[hashname](data).hexdigest()
+            digest = hash_func(data).hexdigest()
             lines.append(f"  {digest} {len(data)} {filename}")
     return "\n".join(lines) + "\n"
 
@@ -808,6 +808,7 @@ def run_mirror(config: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "apt-mirror.py", str(config)],
         capture_output=True,
+        check=False,
         text=True,
         timeout=120,
         cwd=REPO_ROOT,

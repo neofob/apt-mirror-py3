@@ -45,7 +45,9 @@ def _write(path: Path, content: bytes) -> None:
 
 def _sh_syntax_ok(script: Path) -> None:
     """Assert the generated script passes ``sh -n``."""
-    result = subprocess.run(["sh", "-n", str(script)], capture_output=True, text=True)
+    result = subprocess.run(
+        ["sh", "-n", str(script)], check=False, capture_output=True, text=True
+    )
     assert result.returncode == 0, f"sh -n failed: {result.stderr}"
 
 
@@ -186,7 +188,9 @@ class TestWriteCleanscript:
         # quoted token must print the original path.
         check = tmp_path / "check.sh"
         check.write_text("echo -n 'we'\\''ird.bin'\n", encoding="utf-8")
-        result = subprocess.run(["sh", str(check)], capture_output=True, text=True)
+        result = subprocess.run(
+            ["sh", str(check)], check=False, capture_output=True, text=True
+        )
         assert result.stdout == "we'ird.bin"
 
 

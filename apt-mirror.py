@@ -234,8 +234,7 @@ def sanitise_uri(url: str, tilde: bool = False, plus: bool = False) -> str:
         uri = uri.replace("~", "%7E")
     if plus:
         uri = uri.replace("+", "%2B")
-    if uri.endswith("/"):
-        uri = uri[:-1]
+    uri = uri.removesuffix("/")
     return uri
 
 
@@ -1917,7 +1916,7 @@ def run_postmirror(variables: dict[str, str]) -> None:
     command = [script] if os.access(script, os.X_OK) else ["/bin/sh", script]
     return_code: int | None = None
     try:
-        result = subprocess.run(command, cwd=mirror_dir)
+        result = subprocess.run(command, check=False, cwd=mirror_dir)
         return_code = result.returncode
     except OSError as error:
         logger.warning(

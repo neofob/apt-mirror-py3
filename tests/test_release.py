@@ -30,7 +30,7 @@ SHA1_CONTRIB = "4" * 40
 SHA256_MAIN = "2" * 64
 SHA512_MAIN = "3" * 128
 
-BINARY_SPEC_KW = dict(uri="http://example.com/debian", distribution="stable")
+BINARY_SPEC_KW = {"uri": "http://example.com/debian", "distribution": "stable"}
 
 
 def make_release(by_hash_line, names, size=100):
@@ -75,7 +75,7 @@ def write_release(tmp_path, text, name="InRelease"):
 
 
 def binary_spec(am, components=None, **overrides):
-    kw = dict(type="deb", arch="amd64")
+    kw = {"type": "deb", "arch": "amd64"}
     kw.update(BINARY_SPEC_KW)
     kw["components"] = components
     kw.update(overrides)
