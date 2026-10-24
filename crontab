@@ -1,0 +1,5 @@
+# apt-mirror-py3: mirror update every 6 hours (00:00, 06:00, 12:00, 18:00).
+# Installed to /etc/cron.d/apt-mirror by the Dockerfile; the job and its
+# output run as aptmirror (uid:gid 1000:1000).
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 */6 * * * aptmirror /usr/local/bin/apt-mirror | tee -a /var/spool/apt-mirror/var/cron.log

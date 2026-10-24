@@ -6,26 +6,28 @@
 # Run (persist the mirror spool):
 #   docker run -d --name apt-mirror -v my-mirror:/var/spool/apt-mirror apt-mirror-py3
 #
-# The crond daemon itself must run as root: Debian's cron requires
-# /var/run/crond.pid and a root-owned cronspool. The cron job, and
-# everything it runs and writes (apt-mirror, tee, cron.log), runs as
-# uid:gid 1000:1000 (user "aptmirror").
+# The crond daemon itself must run as root: cronie's crond requires
+# /run/crond.pid. The cron job, and everything it runs and writes
+# (apt-mirror, tee, cron.log), runs as uid:gid 1000:1000 (user
+# "aptmirror").
 
 FROM debian:trixie-slim
 
 # python3 + python3-venv: the virtual environment (venv pip via ensurepip).
-# cron + tini: the scheduler and its init wrapper.
+# cronie + tini: the scheduler and its init wrapper.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        cron \
+        cronie \
         python3 \
         python3-venv \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
-# The unprivileged mirror user (uid:gid 1000:1000).
+# The unprivileged mirror user (uid:gid 1000:1000). cronie chdirs each job
+# into its user's home directory, so the home must exist or every job
+# fails with "chdir failed".
 RUN groupadd --gid 1000 aptmirror \
-    && useradd --uid 1000 --gid aptmirror --no-create-home --shell /usr/sbin/nologin aptmirror
+    && useradd --uid 1000 --gid aptmirror --create-home --shell /usr/sbin/nologin aptmirror
 
 # Install this repository into a virtual environment. Only the package,
 # the shim, and the pyproject are copied: tests/ has an __init__.py and
@@ -55,16 +57,17 @@ RUN mkdir -p /var/spool/apt-mirror/mirror \
              /var/spool/apt-mirror/var \
     && chown -R 1000:1000 /var/spool/apt-mirror
 
-# Default mirror config.
-COPY mirror.list /etc/apt/mirror.list
+# Default mirror config (the repository ships this as an example; an
+# operator can override it at build time or by mounting /etc/apt/).
+COPY mirror.list.example /etc/apt/mirror.list
 
 # Mirror update every 6 hours (00:00, 06:00, 12:00, 18:00). The job and
-# its output run as aptmirror (uid:gid 1000:1000).
-RUN printf '%s\n' \
-        'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-        '0 */6 * * * aptmirror /usr/local/bin/apt-mirror | tee -a /var/spool/apt-mirror/var/cron.log' \
-    > /etc/cron.d/apt-mirror \
-    && chmod 644 /etc/cron.d/apt-mirror
+# its output run as aptmirror (uid:gid 1000:1000). cron.d files must not
+# be group/other-writable, hence the explicit 0644.
+COPY crontab /etc/cron.d/apt-mirror
+RUN chmod 0644 /etc/cron.d/apt-mirror
 
-# crond in the foreground under tini; tini reaps cron's per-job children.
-ENTRYPOINT ["/usr/bin/tini", "-v", "--", "/usr/sbin/cron", "-f"]
+# crond (cronie) in the foreground under tini; tini reaps crond's
+# per-job children. -x load logs job-file load events to stderr (the
+# container log).
+ENTRYPOINT ["/usr/bin/tini", "-v", "--", "/usr/sbin/crond", "-n", "-x", "load"]
