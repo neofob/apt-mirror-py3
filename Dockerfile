@@ -67,7 +67,22 @@ COPY mirror.list.example /etc/apt/mirror.list
 COPY crontab /etc/cron.d/apt-mirror
 RUN chmod 0644 /etc/cron.d/apt-mirror
 
-# crond (cronie) in the foreground under tini; tini reaps crond's
-# per-job children. -x load logs job-file load events to stderr (the
+# Entrypoint: ensure the spool directories exist and are owned by the
+# mirror user, then exec crond (cronie) in the foreground. The chown
+# guards a first-run bind mount: if the docker daemon auto-creates the
+# host spool directory it is root-owned, which the uid-1000 cron job
+# cannot write. Only the four spool directories are chowned (never
+# recursively), so a large spool pays no cost. tini reaps crond's
+# per-job children; -x load logs job-file load events to stderr (the
 # container log).
-ENTRYPOINT ["/usr/bin/tini", "-v", "--", "/usr/sbin/crond", "-n", "-x", "load"]
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        'for dir in /var/spool/apt-mirror /var/spool/apt-mirror/mirror /var/spool/apt-mirror/skel /var/spool/apt-mirror/var; do' \
+        '    mkdir -p "$dir"' \
+        '    chown 1000:1000 "$dir"' \
+        'done' \
+        'exec /usr/sbin/crond -n -x load' \
+    > /usr/local/bin/cronie-init \
+    && chmod 755 /usr/local/bin/cronie-init
+
+ENTRYPOINT ["/usr/bin/tini", "-v", "--", "/usr/local/bin/cronie-init"]

@@ -1,0 +1,46 @@
+---
+services:
+  apt-mirror:
+    container_name: apt-mirror
+    hostname: apt-mirror
+    image: neofob/apt-mirror:mirror
+    build: .
+    restart: unless-stopped
+    volumes:
+      # Spool bind directory: on first run docker auto-creates it as
+      # root; the image entrypoint moves ownership to 1000:1000 before
+      # crond starts, so a cold start works without host prep.
+      - "${MIRROR:-/mnt/data/apt-mirror}:/var/spool/apt-mirror"
+      - "${MIRROR_LIST:-./mirror.list}:/etc/apt/mirror.list:ro"
+      # Optional: if the script is absent the tool skips postmirror.
+      - "${POST_MIRROR:-./postmirror.sh}:/var/spool/apt-mirror/var/postmirror.sh:ro"
+    # cron.d/apt-mirror must be owned by root
+    #      - "${CRONTAB_DIR}:/etc/cron.d:ro"
+    tmpfs:
+      - "/var/run"
+      - "/var/log"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  apt-mirror-server:
+    container_name: apt-mirror-server
+    hostname: apt-mirror-server
+    image: neofob/apt-mirror:server
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    command: [nginx-debug, '-g', 'daemon off;']
+    restart: unless-stopped
+    volumes:
+      # Must be ${MIRROR}/mirror: the host-prefixed spool subtree that
+      # nginx serves as /mirror.
+      - "${MIRROR_DIR:-/mnt/data/apt-mirror/mirror}:/mirror:ro"
+      - "${NGINX_CONF:-./nginx.conf}:/etc/nginx/conf.d/mirror.conf:ro"
+    ports:
+      - "80:80"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
