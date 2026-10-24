@@ -1,0 +1,10 @@
+.git
+__pycache__/
+*.pyc
+.venv/
+venv/
+tests/
+docs/
+apt-mirror
+Dockerfile
+.dockerignore
