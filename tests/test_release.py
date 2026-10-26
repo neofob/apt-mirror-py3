@@ -163,7 +163,7 @@ class TestIndexUrlsByHash:
         spec = binary_spec(am, components=["main", "contrib"])
         urls = {u.filename: u for u in am.index_urls_for(spec, info)}
         main = urls["main/binary-amd64/Packages.gz"]
-        assert main.by_hash == "sha512"
+        assert main.by_hash == "SHA512"
         assert main.by_hashsum == SHA512_MAIN
 
     def test_per_file_strongest_sha1_only(self, am, tmp_path) -> None:
@@ -173,8 +173,24 @@ class TestIndexUrlsByHash:
         spec = binary_spec(am, components=["main", "contrib"])
         urls = {u.filename: u for u in am.index_urls_for(spec, info)}
         contrib = urls["contrib/binary-amd64/Packages.gz"]
-        assert contrib.by_hash == "sha1"
+        assert contrib.by_hash == "SHA1"
         assert contrib.by_hashsum == SHA1_CONTRIB
+
+    def test_uses_release_hash_section_name_verbatim(self, am, tmp_path) -> None:
+        """Regression (by-hash 404 fix): the by-hash path must keep the hash
+        section name exactly as written in the Release file (``SHA512`` /
+        ``SHA256`` / ``SHA1`` / ``MD5Sum``), like apt and the Perl original —
+        a lower-cased segment (``sha512``) produces 404s on real mirrors."""
+        path = write_release(tmp_path, multi_release("Acquire-By-Hash: yes"))
+        info = am.parse_release(path)
+        spec = binary_spec(am, components=["main", "contrib"])
+        urls = {u.filename: u for u in am.index_urls_for(spec, info)}
+        main = urls["main/binary-amd64/Packages.gz"]
+        contrib = urls["contrib/binary-amd64/Packages.gz"]
+        assert main.by_hash_path == f"main/binary-amd64/by-hash/SHA512/{SHA512_MAIN}"
+        assert (
+            contrib.by_hash_path == f"contrib/binary-amd64/by-hash/SHA1/{SHA1_CONTRIB}"
+        )
 
     def test_by_hash_no_all_canonical(self, am, tmp_path) -> None:
         path = write_release(tmp_path, multi_release("Acquire-By-Hash: no"))
@@ -207,11 +223,11 @@ class TestByHashPath:
         spec = binary_spec(am, components=["main", "contrib"])
         urls = {u.filename: u for u in am.index_urls_for(spec, info)}
         main = urls["main/binary-amd64/Packages.gz"]
-        assert main.by_hash_path == f"main/binary-amd64/by-hash/sha512/{SHA512_MAIN}"
+        assert main.by_hash_path == f"main/binary-amd64/by-hash/SHA512/{SHA512_MAIN}"
         base = am.dist_base(spec)
         assert base + main.by_hash_path == (
             f"http://example.com/debian/dists/stable/main/binary-amd64/"
-            f"by-hash/sha512/{SHA512_MAIN}"
+            f"by-hash/SHA512/{SHA512_MAIN}"
         )
 
     def test_canonical_path_is_filename(self, am) -> None:

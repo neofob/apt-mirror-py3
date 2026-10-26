@@ -277,7 +277,7 @@ class AptMirror:
                     for entry in info.entries.get(idx.filename, []):
                         if entry.hashname not in HASH_STRENGTH:
                             continue
-                        name = entry.hashname.lower()
+                        name = entry.hashname
                         if name == idx.by_hash:
                             continue
                         other_path = (

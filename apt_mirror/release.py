@@ -114,9 +114,11 @@ class IndexUrl:
     dist root (e.g. ``main/binary-amd64/Packages.gz``); for the no-Release
     well-known set it is relative to the repo URI (e.g.
     ``dists/stable/main/binary-amd64/Packages.gz``).  ``by_hash`` is the
-    lower-cased name of the file's strongest advertised hash when an
-    Acquire-By-Hash download applies, else None (a canonical download);
-    ``by_hashsum`` is the matching digest.
+    name of the file's strongest advertised hash when an Acquire-By-Hash
+    download applies, else None (a canonical download); it is the hash
+    section name exactly as written in the Release file (``SHA512`` /
+    ``SHA256`` / ``SHA1`` / ``MD5Sum``) and doubles as the ``by-hash/``
+    directory segment (spec §5.6.3); ``by_hashsum`` is the matching digest.
     """
 
     filename: str
@@ -240,7 +242,7 @@ def index_urls_for(spec: Repo, info: ReleaseInfo) -> list[IndexUrl]:
             url = IndexUrl(
                 filename=filename,
                 size=strongest.size,
-                by_hash=strongest.hashname.lower(),
+                by_hash=strongest.hashname,
                 by_hashsum=strongest.hashsum,
             )
         else:

@@ -61,7 +61,7 @@ def test_first_run_expected_tree(fixture_repo, tmp_path) -> None:
     )
     digest512 = hashlib.sha512(pkgs.read_bytes()).hexdigest()
     canonical = dist / "main" / "binary-amd64" / "Packages.gz"
-    by_hash = dist / "main" / "binary-amd64" / "by-hash" / "sha512" / digest512
+    by_hash = dist / "main" / "binary-amd64" / "by-hash" / "SHA512" / digest512
     assert canonical.is_file()
     assert by_hash.is_file()
     assert canonical.stat().st_ino == by_hash.stat().st_ino

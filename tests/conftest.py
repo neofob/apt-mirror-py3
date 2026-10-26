@@ -630,7 +630,7 @@ def _build_main_repo(
     ``weak_file`` (a dist-root-relative index name, with ``by_hash`` on)
     builds the spec §7.1 #2 regression fixture: the file is listed only
     under the Release's ``SHA1:`` section and its by-hash copy is
-    published at ``<dir>/by-hash/sha1/<digest>`` instead of under sha512.
+    published at ``<dir>/by-hash/SHA1/<digest>`` instead of under SHA512.
 
     ``multi_arch`` additively also generates
     ``main/binary-i386/Packages.gz`` with its own
@@ -708,17 +708,17 @@ def _build_main_repo(
             ).encode("ascii")
         )
     weak_set = frozenset({weak_file}) if weak_file is not None else None
-    algo_fns = {"sha1": hashlib.sha1, "sha512": hashlib.sha512}
+    algo_fns = {"SHA1": hashlib.sha1, "SHA512": hashlib.sha512}
     for rel, data in indexes.items():
         _write(dist / rel, data)
         if by_hash:
             # Exactly the path IndexUrl.by_hash_path fetches: the strongest
             # hash the file *itself* advertises in the Release.  Every file
             # but the optional ``weak_file`` lists all four sections, so
-            # that strongest is sha512; the weak file lists only SHA1, so
-            # its by-hash copy lives under sha1/ (spec §7.1 #2 fixture).
+            # that strongest is SHA512; the weak file lists only SHA1, so
+            # its by-hash copy lives under SHA1/ (spec §7.1 #2 fixture).
             weak = weak_file is not None and rel == weak_file
-            algo = "sha1" if weak else "sha512"
+            algo = "SHA1" if weak else "SHA512"
             hexdigest = algo_fns[algo](data).hexdigest()
             _write(dist / posixpath.dirname(rel) / "by-hash" / algo / hexdigest, data)
     release = _release_text("dist", "main contrib", indexes, by_hash, weak_set)
@@ -850,7 +850,7 @@ def build_fixture_repo(
       .diff.gz), with by-hash copies wherever ``by_hash`` is on;
       ``weak_hash_file`` (a ``main``-repo index name) instead lists that
       one file under the Release's ``SHA1:`` section only and publishes
-      its by-hash copy under ``sha1/`` (spec §7.1 #2 regression fixture,
+      its by-hash copy under ``SHA1/`` (spec §7.1 #2 regression fixture,
       Task 9); ``multi_arch`` additionally serves a second architecture:
       ``main/binary-i386/Packages.gz`` plus its own
       ``pool/main/m/multi/multi_1.0-1_i386.deb`` (spec §5.1 ``arch=a,b``);

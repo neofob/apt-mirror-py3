@@ -197,7 +197,7 @@ def test_missing_inrelease_and_index_are_404_tolerant(tmp_path: Path) -> None:
         digest = hashlib.sha512(trans.read_bytes()).hexdigest()
         srv.remove("/repo/dists/dist/InRelease")
         srv.remove("/repo/dists/dist/main/i18n/Translation-en.gz")
-        srv.remove(f"/repo/dists/dist/main/i18n/by-hash/sha512/{digest}")
+        srv.remove(f"/repo/dists/dist/main/i18n/by-hash/SHA512/{digest}")
 
         config = write_config(base, {"main": urls["main"]})
         result = run_mirror(config)
@@ -308,7 +308,7 @@ def test_https_repo_verifying_and_unverified(
 def test_weak_hash_by_hash_file_is_not_skipped(tmp_path: Path) -> None:
     """Scenario 5 (spec §7.1 #2): in an Acquire-By-Hash repo a file listed
     only under the weaker ``SHA1:`` section is still downloaded (via its
-    own strongest hash, sha1) and mirrored at its canonical path — the
+    own strongest hash, SHA1) and mirrored at its canonical path — the
     original recorded but never fetched such files."""
     urls = build_fixture_repo(
         tmp_path / "fixture",
@@ -350,12 +350,12 @@ def test_weak_hash_by_hash_file_is_not_skipped(tmp_path: Path) -> None:
         canonical = dist / "main" / "Contents-amd64.gz"
         assert canonical.is_file()
         assert canonical.read_bytes() == expected
-        # The by-hash download lands under sha1/ and fans out to canonical.
+        # The by-hash download lands under SHA1/ and fans out to canonical.
         digest = hashlib.sha1(expected).hexdigest()
-        by_hash = dist / "main" / "by-hash" / "sha1" / digest
+        by_hash = dist / "main" / "by-hash" / "SHA1" / digest
         assert by_hash.is_file()
         assert by_hash.read_bytes() == expected
-        # The rest of the repo keeps mirroring through its own (sha512) hash:
+        # The rest of the repo keeps mirroring through its own (SHA512) hash:
         # the same canonical file must not be the *only* by-hash survivor.
         pkgs = (
             urls.root
@@ -371,7 +371,7 @@ def test_weak_hash_by_hash_file_is_not_skipped(tmp_path: Path) -> None:
             / "main"
             / "binary-amd64"
             / "by-hash"
-            / "sha512"
+            / "SHA512"
             / hashlib.sha512(pkgs).hexdigest()
         ).is_file()
     finally:
@@ -846,19 +846,19 @@ def test_secondary_by_hash_paths_are_hardlinked(tmp_path: Path) -> None:
             / "binary-amd64"
         )
         digests = {
-            "sha512": hashlib.sha512(pkgs).hexdigest(),
-            "sha256": hashlib.sha256(pkgs).hexdigest(),
-            "sha1": hashlib.sha1(pkgs).hexdigest(),
-            "md5sum": hashlib.md5(pkgs).hexdigest(),
+            "SHA512": hashlib.sha512(pkgs).hexdigest(),
+            "SHA256": hashlib.sha256(pkgs).hexdigest(),
+            "SHA1": hashlib.sha1(pkgs).hexdigest(),
+            "MD5Sum": hashlib.md5(pkgs).hexdigest(),
         }
-        anchor = dist / "by-hash" / "sha512" / digests["sha512"]
+        anchor = dist / "by-hash" / "SHA512" / digests["SHA512"]
         assert anchor.is_file()
         assert anchor.read_bytes() == pkgs
         for name, digest in digests.items():
             path = dist / "by-hash" / name / digest
             assert path.is_file(), f"missing secondary by-hash path {name}"
             assert path.read_bytes() == pkgs
-            # Hardlinked into the same inode as the downloaded sha512 copy.
+            # Hardlinked into the same inode as the downloaded SHA512 copy.
             assert path.stat().st_ino == anchor.stat().st_ino, name
     finally:
         _close(urls)
