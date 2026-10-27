@@ -1,5 +1,5 @@
 # `apt-mirror.py`
-*A Python 3 implementation of legacy Perl apt-mirror*
+*A Python 3 implementation of legacy Perl [apt-mirror][3]*
 
 ## AI Models
 * qwen3.8:27b-mtp-q8_0
@@ -14,3 +14,4 @@
 [0]: https://opencode.ai/
 [1]: https://github.com/obra/superpowers
 [2]: https://github.com/ollama/ollama/releases
+[3]: https://github.com/apt-mirror/apt-mirror
