@@ -94,6 +94,7 @@ def download_stage(
             except queue.Empty:
                 return
             display = _strip_userinfo(url)
+            entry: tuple[str, int | str]
             try:
                 written = fetcher.fetch(url, dest_root / sanitise_uri(url, tilde, plus))
             except FetchError as error:
@@ -120,7 +121,7 @@ def download_stage(
     for display, (status, value) in results.items():
         if status == "OK":
             ok += 1
-            byte_count += value
+            byte_count += int(value)
         else:
             failed.append((display, str(value)))
     failed.sort()

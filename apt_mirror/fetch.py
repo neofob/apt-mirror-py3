@@ -287,6 +287,7 @@ class Fetcher:
         (Proxy-Authorization for plain http, CONNECT for tunnelled https).
         """
         proxy = self._proxies.get(scheme)
+        conn: http.client.HTTPConnection
         if proxy is None:
             if scheme == "https":
                 conn = http.client.HTTPSConnection(

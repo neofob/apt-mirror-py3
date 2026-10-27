@@ -5,6 +5,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from apt_mirror.errors import AptMirrorError
 from apt_mirror.uri import sanitise_uri
@@ -237,7 +238,7 @@ _DEB_RE = re.compile(
 _CLEAN_RE = re.compile(r"^(?P<kind>skip-clean|clean)\s+(?P<uri>\S+)$")
 
 
-def parse_config_line(line: str) -> dict | None:
+def parse_config_line(line: str) -> dict[str, Any] | None:
     """Parse one config line into a small dict.
 
     Returns None for blank lines and ``#`` comment lines.  Any other

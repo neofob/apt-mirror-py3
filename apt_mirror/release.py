@@ -81,12 +81,12 @@ def parse_release(path: Path) -> ReleaseInfo:
             if match is not None:
                 content = match.group(1)
                 parts = content.split()
-                entry = None
+                entry: HashEntry | None = None
                 if len(parts) == 3:
                     try:
                         size = int(parts[1])
                     except ValueError:
-                        size = None
+                        pass
                     else:
                         entry = HashEntry(current_hash, parts[0], size, parts[2])
                 if entry is None:
@@ -180,7 +180,7 @@ def _index_patterns(spec: Repo) -> list[re.Pattern[str]]:
         return [re.compile(name) for name in names]
     if spec.type == "deb-src":
         comp = _alternation(spec.components)
-        patterns = (
+        patterns: tuple[str, ...] = (
             f"{comp}/source/Sources{ext}",
             f"{comp}/source/Release",
             f"{comp}/Contents-source{ext}",
@@ -210,9 +210,9 @@ def _strongest_advertised(entries: list[HashEntry]) -> HashEntry | None:
     for entry in entries:
         by_name.setdefault(entry.hashname, entry)
     for name in HASH_STRENGTH:
-        entry = by_name.get(name)
-        if entry is not None:
-            return entry
+        candidate = by_name.get(name)
+        if candidate is not None:
+            return candidate
     return None
 
 

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_MIRROR_LIST = Path(__file__).parent.parent / "mirror.list"
+REPO_MIRROR_LIST = Path(__file__).parent / "fixtures" / "mirror.list"
 
 
 def _crlf_content(*lines: str) -> str:
@@ -274,9 +274,7 @@ def test_repo_mirror_list_parses(am) -> None:
     assert len(parsed.binaries) == 6
     assert len(parsed.sources) == 0
     assert parsed.clean == {
-        "us.archive.ubuntu.com/ubuntu",
-        "download.docker.com/linux/ubuntu",
-        "ppa.launchpad.net/gluster/glusterfs-11/ubuntu",
+        "us.archive.ubuntu.com/ubuntu"
     }
     assert parsed.variables["nthreads"] == "4"
     assert parsed.variables["_tilde"] == "0"

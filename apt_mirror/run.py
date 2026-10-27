@@ -176,6 +176,7 @@ class AptMirror:
     def _stage_release(self, specs: list[Repo]) -> None:
         """-------------------- Stage 1: release (spec §5.5) -----------"""
         self._queue_release_urls(specs)
+        assert self.fetcher is not None
         download_stage(
             "release",
             sorted(self.release_urls),
@@ -224,6 +225,7 @@ class AptMirror:
             info = self._valid_release_info(path)
             if info is None and path.exists():
                 path.unlink(missing_ok=True)
+                assert self.fetcher is not None
                 with contextlib.suppress(FetchError):
                     self.fetcher.fetch(url, path)
                 info = self._valid_release_info(path)
@@ -307,6 +309,7 @@ class AptMirror:
             self._queue_index_urls(spec)
         print(f"Processing metadata files from releases [{''.join(marks)}]")
         print()
+        assert self.fetcher is not None
         download_stage(
             "index",
             sorted(self.index_urls),
@@ -342,6 +345,7 @@ class AptMirror:
         except _INDEX_PARSE_ERRORS:
             path.unlink(missing_ok=True)
             try:
+                assert self.fetcher is not None
                 self.fetcher.fetch(url, path)
             except FetchError:
                 logger.warning("apt-mirror: can't open index %s in process_index", path)
@@ -439,6 +443,7 @@ class AptMirror:
         print(
             f"{format_bytes(self.archives.need_bytes)} will be downloaded into archive."
         )
+        assert self.fetcher is not None
         download_stage(
             "archive",
             sorted(self.archives.urls),
