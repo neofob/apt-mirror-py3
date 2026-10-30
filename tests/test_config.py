@@ -273,9 +273,7 @@ def test_repo_mirror_list_parses(am) -> None:
     parsed = am.parse_config(REPO_MIRROR_LIST)
     assert len(parsed.binaries) == 6
     assert len(parsed.sources) == 0
-    assert parsed.clean == {
-        "us.archive.ubuntu.com/ubuntu"
-    }
+    assert parsed.clean == {"us.archive.ubuntu.com/ubuntu"}
     assert parsed.variables["nthreads"] == "4"
     assert parsed.variables["_tilde"] == "0"
     assert parsed.variables["unlink"] == "1"
