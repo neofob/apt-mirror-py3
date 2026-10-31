@@ -64,10 +64,11 @@ def iter_index_blocks(path: Path) -> Iterator[dict[str, str]]:
     The file is first decompressed by its suffix (see _read_index).
     Blocks are the blank-line-separated chunks of the text; each becomes
     an insertion-ordered dict mapping every field name to its value.
-    An indented continuation line and a repeated column-0 field name both
-    extend the previous field's value, joined with ``\\n``; every value
-    is stripped of surrounding whitespace — the net effect of the
-    original's ``split(/^([\\w\\-]+:)/m)`` plus ``chomp`` plus
+    An indented continuation line extends the previous field's value,
+    joined with ``\\n``; a repeated column-0 field name overwrites the
+    previous value (the original's ``split(/^([\\w\\-]+:)/m)`` + hash
+    semantics keep a single value per field name); every value is stripped
+    of surrounding whitespace — the net effect of the original's chomp plus
     ``remove_spaces``.  A colon inside a value (``Homepage: http://x/``)
     does not start a new field: only a column-0 ``Name:`` does.
     """
@@ -85,11 +86,13 @@ def iter_index_blocks(path: Path) -> Iterator[dict[str, str]]:
         match = _INDEX_FIELD_RE.match(line)
         if match is not None:
             current = match["name"]
-            piece = match["value"].strip()
-        elif current is None:
+            # A repeated column-0 field overwrites whatever came before it:
+            # the original stored fields in a hash keyed by field name.
+            block[current] = match["value"].strip()
             continue
-        else:
-            piece = stripped
+        if current is None:
+            continue
+        piece = stripped
         if not piece:
             continue
         if block.get(current):
@@ -103,15 +106,21 @@ def iter_index_blocks(path: Path) -> Iterator[dict[str, str]]:
 def need_update(mirror_file: Path, size: int) -> bool:
     """Whether ``mirror_file`` must (re)download, and prune a corrupt one.
 
-    True when the file is missing; False when it exists with exactly
-    ``size`` bytes; and True when it exists with a different size, in
-    which case the corrupt file is deleted first so the next download
+    True when the file is missing; True when the existing file's size is
+    falsy (the original's ``return 1 unless ($size)`` treated an absent or
+    zero-size local file as needing an update); False when it exists with
+    exactly ``size`` bytes; and True when it exists with a different size,
+    in which case the corrupt file is deleted first so the next download
     starts from scratch (spec §5.7).  The comparison is against the stat
     size (``st.st_size``, i.e. stat.S_SIZE) — the file is never read.
     """
     try:
         st_size = mirror_file.stat().st_size
     except OSError:
+        return True
+    if not st_size:
+        # Perl: ``return 1 unless ($size)`` — a missing or zero-size local
+        # file always requires (re)downloading.
         return True
     if st_size == size:
         return False

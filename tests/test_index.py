@@ -8,9 +8,10 @@ Pins come from the task brief (step 1) and the controller clarifications:
 
 - ``iter_index_blocks`` decompresses by suffix (``.gz``/``.bz2``/``.lzma``,
   plain otherwise); blocks are separated by blank lines; a repeated
-  column-0 field name and an indented continuation line both extend the
-  previous field's value with ``\\n``; a colon inside a field *value*
-  (``Homepage: http://x/``) does not start a new field.
+  column-0 field name overwrites the previous value while an indented
+  continuation line extends the previous field's value with ``\\n``; a
+  colon inside a field *value* (``Homepage: http://x/``) does not start a
+  new field.
 - ``parse_index`` yields one ``PackageRec`` per ``Filename:`` block and per
   ``File:`` line of a Sources block; hashes and size are taken verbatim
   (missing hash -> None, missing ``Size:`` -> 0); a ``Directory:`` value
@@ -137,8 +138,8 @@ class TestSources:
             "Package: foo\n"
             "Version: 1.0-1\n"
             "Directory: /pool/main/x/foo\n"
-            "File: 5d41402abc4b2a76b9719d911017c592 200 foo_1.0-1.dsc\n"
-            "File: 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d 300 foo_1.0-1.debian.tar.xz\n"
+            "Files: 5d41402abc4b2a76b9719d911017c592 200 foo_1.0-1.dsc\n"
+            " 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d 300 foo_1.0-1.debian.tar.xz\n"
         )
         path = write_index(tmp_path, "Sources")
         path.write_text(text, encoding="utf-8")
@@ -211,6 +212,19 @@ class TestNeedUpdate:
         assert am.need_update(path, 640) is True
         assert not path.exists()
 
+    def test_zero_size_local_file_always_updates(self, am, tmp_path) -> None:
+        """A zero-size local index is treated as needing an update.
+
+        The original's ``need_update`` begins with ``return 1 unless ($size)``,
+        so a missing or zero-size local file never counts as "already up to
+        date" (regression test: the Python port dropped the falsy-size check).
+        """
+        path = tmp_path / "empty.deb"
+        path.write_bytes(b"")
+        assert am.need_update(path, 0) is True
+        assert am.need_update(path, 64) is True
+        assert path.exists()  # the early return does not prune the file
+
 
 class TestBlockSeparation:
     """Blocks are separated by a single blank line; colons in values
@@ -249,3 +263,40 @@ class TestBlockSeparation:
         assert beta.md5 == MD5_ALL
         assert beta.sha1 is None
         assert beta.sha256 is None
+
+
+class TestFieldRepetition:
+    """Repeated column-0 field names overwrite; continuations extend."""
+
+    def test_repeated_field_overwrites_previous_value(self, am, tmp_path) -> None:
+        """A repeated column-0 field keeps the LAST value (Perl hash order).
+
+        The original ``split(/^([\\w\\-]+:)/m)`` + hash semantics store one
+        value per field name, so a second ``Filename:`` replaces the first
+        rather than appending (regression test: the Python port joined with
+        ``\\n``).
+        """
+        text = (
+            "Package: alpha\n"
+            "Filename: pool/main/a/alpha/alpha_1-1_all.deb\n"
+            "Size: 40\n"
+            "Filename: pool/main/a/alpha/alpha_2-1_all.deb\n"
+            "Size: 41\n"
+        )
+        path = write_index(tmp_path, "Packages")
+        path.write_text(text, encoding="utf-8")
+
+        blocks = list(am.iter_index_blocks(path))
+        assert len(blocks) == 1
+        assert blocks[0]["Filename"] == "pool/main/a/alpha/alpha_2-1_all.deb"
+        assert blocks[0]["Size"] == "41"
+
+    def test_continuation_line_extends_previous_field(self, am, tmp_path) -> None:
+        """An indented continuation line appends to the previous field."""
+        text = "Package: alpha\nDescription: first line\n second line\n"
+        path = write_index(tmp_path, "Packages")
+        path.write_text(text, encoding="utf-8")
+
+        blocks = list(am.iter_index_blocks(path))
+        assert len(blocks) == 1
+        assert blocks[0]["Description"] == "first line\nsecond line"
