@@ -378,6 +378,45 @@ def test_weak_hash_by_hash_file_is_not_skipped(tmp_path: Path) -> None:
         _close(urls)
 
 
+def test_uncompressed_index_is_fetched_canonical_not_by_hash(tmp_path: Path) -> None:
+    """Scenario 17 (by-hash 404): an uncompressed index listed in an
+    Acquire-By-Hash Release must be queued and fetched through its canonical
+    location.  Before the fix the by-hash decision keyed only off the
+    ``Acquire-By-Hash`` flag, so the uncompressed ``main/binary-all/Packages``
+    was queued as ``<base>/<dir>/by-hash/SHA512/<digest-of-uncompressed>`` —
+    a URL real mirrors answer 404 — while the compressed variants kept
+    using by-hash.  The run must therefore queue the canonical spelling for
+    the uncompressed index and still mirror it."""
+    urls = build_fixture_repo(
+        tmp_path / "fixture", insecure_repo=False, unsigned_src_repo=False
+    )
+    try:
+        base = tmp_path / "spool"
+        config = write_config(base, {"main": urls["main"]})
+        result = run_mirror(config)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        index_urls = (base / "var" / "index-urls.txt").read_text(encoding="utf-8")
+        canonical_lines = [
+            line
+            for line in index_urls.splitlines()
+            if line.endswith("dists/dist/main/binary-all/Packages")
+        ]
+        assert canonical_lines, index_urls
+        for line in canonical_lines:
+            assert "/by-hash/" not in line, line
+        compressed_lines = [
+            line for line in index_urls.splitlines() if "/by-hash/SHA512/" in line
+        ]
+        assert compressed_lines, index_urls
+
+        # The uncompressed index still lands in the mirror tree, canonically.
+        dist = base / "mirror" / _host(urls["main"]) / "repo" / "dists" / "dist"
+        assert (dist / "main" / "binary-all" / "Packages").is_file()
+    finally:
+        _close(urls)
+
+
 def test_unsigned_source_fallback_urls_carry_dists_prefix(tmp_path: Path) -> None:
     """Scenario 6 (spec §7.1 #1): the no-Release well-known fallback for
     the unsigned ``nosrc`` source repo queues ``dists/``-prefixed URLs —

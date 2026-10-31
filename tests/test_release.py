@@ -213,6 +213,56 @@ class TestIndexUrlsByHash:
         assert urls[0].by_hashsum is None
         assert urls[0].filename == "main/binary-amd64/Packages.gz"
 
+    def test_uncompressed_index_falls_back_to_canonical(self, am, tmp_path) -> None:
+        """Regression (by-hash 404): with ``Acquire-By-Hash: yes`` a Release
+        entry naming an UNCOMPRESSED index (no compression suffix) must be
+        fetched from its canonical location, not through a by-hash URL built
+        from that file's own digest — mirrors publish by-hash objects only
+        for compressed indexes, so the by-hash spelling of an uncompressed
+        file (e.g. ``by-hash/SHA256/<sha256 of the uncompressed Translation>``)
+        comes back 404 (the reported noble i18n failure)."""
+        path = write_release(
+            tmp_path, make_release("Acquire-By-Hash: yes", ["main/binary-all/Packages"])
+        )
+        info = am.parse_release(path)
+        spec = binary_spec(am, components=["main"])
+        urls = am.index_urls_for(spec, info)
+        assert len(urls) == 1
+        url = urls[0]
+        assert url.filename == "main/binary-all/Packages"
+        assert url.by_hash is None
+        assert url.by_hashsum is None
+        assert url.by_hash_path == url.filename
+
+    def test_uncompressed_i18n_translation_falls_back_to_canonical(
+        self, am, tmp_path
+    ) -> None:
+        """Regression (by-hash 404, i18n shape of the noble failure): an
+        uncompressed ``i18n/Translation-*`` entry listed under ``Acquire-By-
+        Hash: yes`` is fetched canonically, while its compressed sibling is
+        still fetched via by-hash (with the compressed file's digest)."""
+        text = (
+            "Origin: Test\n"
+            "Suite: stable\n"
+            "Components: universe\n"
+            "Architectures: amd64 all\n"
+            "Acquire-By-Hash: yes\n"
+            "SHA256:\n"
+            f"  {'5' * 64} 32194499 universe/i18n/Translation-en\n"
+            f"  {'6' * 64} 8424803 universe/i18n/Translation-en.gz\n"
+        )
+        path = write_release(tmp_path, text)
+        info = am.parse_release(path)
+        spec = binary_spec(am, components=["universe"])
+        urls = {u.filename: u for u in am.index_urls_for(spec, info)}
+        uncompressed = urls["universe/i18n/Translation-en"]
+        assert uncompressed.by_hash is None
+        assert uncompressed.by_hashsum is None
+        assert uncompressed.by_hash_path == uncompressed.filename
+        compressed = urls["universe/i18n/Translation-en.gz"]
+        assert compressed.by_hash is not None
+        assert compressed.by_hashsum == "6" * 64
+
 
 class TestByHashPath:
     """IndexUrl.by_hash_path is the exact by-hash or canonical path form."""
@@ -317,6 +367,42 @@ class TestIndexUrlPatterns:
         assert "main/source/Release" in urls
         assert "main/Contents-source.gz" in urls
         assert "main/binary-amd64/Packages.gz" not in urls
+
+    def test_dep11_compressed_variants_are_queued(self, am, tmp_path) -> None:
+        """The compressed dep11 members listed in the Release (``*.tar.gz`` /
+        ``*.yml.gz`` / ``*.yml.xz``) must be queued like any other index."""
+        names = [
+            "universe/dep11/icons-64x64.tar.gz",
+            "universe/dep11/Components-amd64.yml.gz",
+        ]
+        path = write_release(tmp_path, make_release("Acquire-By-Hash: no", names))
+        info = am.parse_release(path)
+        spec = binary_spec(am, components=["universe"])
+        urls = am.index_urls_for(spec, info)
+        assert {u.filename for u in urls} == {
+            "universe/dep11/icons-64x64.tar.gz",
+            "universe/dep11/Components-amd64.yml.gz",
+        }
+
+    def test_dep11_plain_suffixed_names_are_not_queued(self, am, tmp_path) -> None:
+        """Regression (noble docker FAIL): dep11 objects are published under
+        compressed names only — the Release lists ``*.tar.gz`` / ``*.yml.gz`` /
+        ``*.yml.xz``, and the compression-less spellings such as
+        ``universe/dep11/icons-64x64.tar`` or ``universe/dep11/Components-amd64.yml``
+        are not served (real mirrors answer their canonical URLs with 404, which
+        surfaced as ``FAIL http://us.archive.ubuntu.com/ubuntu/dists/noble/
+        universe/dep11/icons-64x64.tar``).  The dep11 pattern set must require
+        a compression suffix, like the Perl original's anchored
+        ``${compressed_extension_regex}$``."""
+        names = [
+            "universe/dep11/icons-64x64.tar",
+            "universe/dep11/Components-amd64.yml",
+        ]
+        path = write_release(tmp_path, make_release("Acquire-By-Hash: no", names))
+        info = am.parse_release(path)
+        spec = binary_spec(am, components=["universe"])
+        urls = am.index_urls_for(spec, info)
+        assert urls == []
 
 
 class TestDistBase:

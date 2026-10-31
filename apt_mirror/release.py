@@ -32,6 +32,24 @@ KNOWN_EXTENSIONS: tuple[str, ...] = (".gz", ".xz", ".bz2", ".lzma", "")
 _ANY_HASH_HEADER_RE = re.compile(r"^(?P<hash>[A-Za-z0-9]+):$")
 #: A hash-section continuation line: leading whitespace plus its remainder.
 _HASH_LINE_RE = re.compile(r"^ +(.*)$")
+#: A compressed-index suffix, anchored at end of filename: ``.gz`` /
+#: ``.bz2`` / ``.xz`` / ``.lzma``.  An entry naming no such suffix is the
+#: uncompressed index and never gets a by-hash download (mirrors publish
+#: by-hash objects for compressed indexes; spec §5.6.3).
+_COMPRESSED_SUFFIX_RE = re.compile(_RELEASE_EXT_RE + "$")
+
+
+def _has_compression_suffix(filename: str) -> bool:
+    """Whether the Release entry ``filename`` names a compressed index.
+
+    A filename ending in ``.gz`` / ``.bz2`` / ``.xz`` / ``.lzma`` is
+    compressed; one with no such suffix is the plain (uncompressed) index.
+    Compressed entries are the ones a by-hash download can address; an
+    uncompressed entry is fetched from its canonical location even when
+    the repo opts into ``Acquire-By-Hash`` (mirrors answer by-hash lookups
+    of uncompressed files with 404, like the real noble i18n failure).
+    """
+    return _COMPRESSED_SUFFIX_RE.search(filename) is not None
 
 
 @dataclass
@@ -119,6 +137,9 @@ class IndexUrl:
     section name exactly as written in the Release file (``SHA512`` /
     ``SHA256`` / ``SHA1`` / ``MD5Sum``) and doubles as the ``by-hash/``
     directory segment (spec §5.6.3); ``by_hashsum`` is the matching digest.
+    A by-hash download applies to compressed index files only: an entry
+    without a compression suffix (the uncompressed index) keeps both None
+    and is fetched canonically.
     """
 
     filename: str
@@ -169,10 +190,15 @@ def _index_patterns(spec: Repo) -> list[re.Pattern[str]]:
     ``binary-<arch|all>/Packages`` + ``Release``, cnf, dep11, i18n for
     binary repos; ``source/Sources``, ``source/Release`` and
     ``Contents-source`` for source repos; flat-repo variants mirror only
-    the single root ``Packages``/``Sources``.  The compression extension
-    is optional: a Release may list an uncompressed index filename
-    (``.../Packages``), and the stage-2/3 pipeline handles those like any
-    other skel index (spec §5.7 opens the uncompressed file as-is).
+    the single root ``Packages``/``Sources``.  The compression extension is
+    optional for the generic indexes: a Release may list an uncompressed
+    index filename (``.../Packages``), and the stage-2/3 pipeline handles those
+    like any other skel index (spec §5.7 opens the uncompressed file as-is).
+    The dep11 objects are the exception: they are published compressed only
+    (``*.tar.gz`` / ``*.yml.gz`` / ``*.yml.xz``), so their patterns REQUIRE a
+    compression suffix — the compression-less spellings (``*.tar`` / ``*.yml``)
+    are not served by real mirrors and must never be queued (the Perl
+    original anchors ``${compressed_extension_regex}$``).
     """
     ext = r"(?:" + _RELEASE_EXT_RE + ")?"
     if spec.components is None:
@@ -194,8 +220,9 @@ def _index_patterns(spec: Repo) -> list[re.Pattern[str]]:
             f"{comp}/(?:debian-installer/)?binary-{arch}/Packages{ext}",
             f"{comp}/(?:debian-installer/)?binary-{arch}/Release",
             f"{comp}/cnf/Commands-{arch}{ext}",
-            f"{comp}/dep11/Components-{arch}.*{ext}",
-            f"{comp}/dep11/icons-.*{ext}",
+            # dep11 is compressed-only (see docstring): require the suffix.
+            f"{comp}/dep11/Components-{arch}.*{_RELEASE_EXT_RE}",
+            f"{comp}/dep11/icons-.*{_RELEASE_EXT_RE}",
             f"{comp}/i18n/Translation-.*{ext}",
         )
     return [re.compile(pattern) for pattern in patterns]
@@ -222,14 +249,18 @@ def index_urls_for(spec: Repo, info: ReleaseInfo) -> list[IndexUrl]:
     Filters ``info.entries``' filenames against the pattern set for the
     repo's type, architecture and components and returns one IndexUrl per
     matching filename, deduplicated by (filename, by_hash).  When the
-    Release requests ``Acquire-By-Hash: yes`` each file is fetched via the
-    strongest hash *it itself* advertises (spec §7.1 fix: files listed
-    only under a weaker section are still mirrored, not silently dropped);
-    a filename with no advertised entries — and every file when the
-    request is absent or not exactly ``yes`` — falls back to the canonical
-    path (``by_hash is None``).  A file listed only under sections we do
-    not support (e.g. SHA384) likewise falls back to canonical, but
-    raises a warning naming the file (spec §5.6.3).
+    Release requests ``Acquire-By-Hash: yes`` each compressed file is
+    fetched via the strongest hash *it itself* advertises (spec §7.1 fix:
+    files listed only under a weaker section are still mirrored, not
+    silently dropped); a filename with no advertised entries — and every
+    file when the request is absent or not exactly ``yes`` — falls back to
+    the canonical path (``by_hash is None``).  A file listed only under
+    sections we do not support (e.g. SHA384) likewise falls back to canonical,
+    but raises a warning naming the file (spec §5.6.3).  An entry that names
+    no compressed index (no ``.gz``/``.bz2``/``.xz``/``.lzma`` suffix) is
+    fetched canonically as well: mirrors answer by-hash lookups of
+    uncompressed files with 404, so the by-hash spelling is only built for
+    compressed entries.
     """
     patterns = _index_patterns(spec)
     urls: list[IndexUrl] = []
@@ -238,7 +269,7 @@ def index_urls_for(spec: Repo, info: ReleaseInfo) -> list[IndexUrl]:
         if not any(pattern.fullmatch(filename) for pattern in patterns):
             continue
         strongest = _strongest_advertised(entries)
-        if info.by_hash and strongest is not None:
+        if info.by_hash and strongest is not None and _has_compression_suffix(filename):
             url = IndexUrl(
                 filename=filename,
                 size=strongest.size,
