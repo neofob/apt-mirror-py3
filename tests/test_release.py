@@ -234,13 +234,15 @@ class TestIndexUrlsByHash:
         assert url.by_hashsum is None
         assert url.by_hash_path == url.filename
 
-    def test_uncompressed_i18n_translation_falls_back_to_canonical(
+    def test_uncompressed_i18n_translation_resolves_to_compressed_sibling(
         self, am, tmp_path
     ) -> None:
         """Regression (by-hash 404, i18n shape of the noble failure): an
         uncompressed ``i18n/Translation-*`` entry listed under ``Acquire-By-
-        Hash: yes`` is fetched canonically, while its compressed sibling is
-        still fetched via by-hash (with the compressed file's digest)."""
+        Hash: yes`` resolves to its compressed sibling
+        (``universe/i18n/Translation-en.gz``), which is fetched via by-hash
+        with the compressed file's digest — the bare (uncompressed) canonical
+        URL is never fetched, because mirrors answer it with 404."""
         text = (
             "Origin: Test\n"
             "Suite: stable\n"
@@ -255,13 +257,97 @@ class TestIndexUrlsByHash:
         info = am.parse_release(path)
         spec = binary_spec(am, components=["universe"])
         urls = {u.filename: u for u in am.index_urls_for(spec, info)}
-        uncompressed = urls["universe/i18n/Translation-en"]
-        assert uncompressed.by_hash is None
-        assert uncompressed.by_hashsum is None
-        assert uncompressed.by_hash_path == uncompressed.filename
+        assert "universe/i18n/Translation-en" not in urls
         compressed = urls["universe/i18n/Translation-en.gz"]
         assert compressed.by_hash is not None
         assert compressed.by_hashsum == "6" * 64
+
+
+class TestUncompressedIndexResolution:
+    """Regression (noble mirror FAIL): real mirrors publish indexes
+    compressed while the Release files still carry the bare (uncompressed)
+    spelling, e.g. Ubuntu noble's Release lists both
+    ``multiverse/binary-amd64/Packages`` and ``multiverse/binary-amd64/Packages.gz``
+    under their own hash sections — but the bare canonical URL answers
+    HTTP 404, the compressed one serves.  An uncompressed Release entry must
+    therefore resolve to the compressed sibling the Release lists."""
+
+    def test_binary_uncompressed_entry_resolves_to_compressed_sibling(
+        self, am, tmp_path
+    ) -> None:
+        """``main/binary-amd64/Packages`` + ``main/binary-amd64/Packages.gz``
+        must download the compressed sibling via by-hash, not the bare name
+        canonically."""
+        text = (
+            "Origin: Test\n"
+            "Suite: stable\n"
+            "Components: main\n"
+            "Architectures: amd64 all\n"
+            "Acquire-By-Hash: yes\n"
+            "SHA512:\n"
+            f"  {'3' * 128} 1000 main/binary-amd64/Packages\n"
+            f"  {'3' * 128} 2000 main/binary-amd64/Packages.gz\n"
+        )
+        path = write_release(tmp_path, text)
+        info = am.parse_release(path)
+        spec = binary_spec(am, components=["main"])
+        urls = am.index_urls_for(spec, info)
+        assert len(urls) == 1
+        url = urls[0]
+        assert url.filename == "main/binary-amd64/Packages.gz"
+        assert url.by_hash == "SHA512"
+        assert url.by_hashsum == "3" * 128
+        assert url.by_hash_path == f"main/binary-amd64/by-hash/SHA512/{'3' * 128}"
+
+    def test_cnf_uncompressed_entry_resolves_to_compressed_sibling(
+        self, am, tmp_path
+    ) -> None:
+        """``multiverse/cnf/Commands-amd64`` + ``multiverse/cnf/Commands-amd64.xz``
+        must download the compressed sibling (``xz`` here, ``.gz`` elsewhere)."""
+        text = (
+            "Origin: Test\n"
+            "Suite: stable\n"
+            "Components: multiverse\n"
+            "Architectures: amd64 all\n"
+            "Acquire-By-Hash: yes\n"
+            "SHA256:\n"
+            f"  {'5' * 64} 35624 multiverse/cnf/Commands-amd64\n"
+            f"  {'6' * 64} 8328 multiverse/cnf/Commands-amd64.xz\n"
+        )
+        path = write_release(tmp_path, text)
+        info = am.parse_release(path)
+        spec = binary_spec(am, components=["multiverse"])
+        urls = {u.filename: u for u in am.index_urls_for(spec, info)}
+        assert "multiverse/cnf/Commands-amd64" not in urls
+        assert "multiverse/cnf/Commands-amd64.xz" in urls
+        compressed = urls["multiverse/cnf/Commands-amd64.xz"]
+        assert compressed.by_hash == "SHA256"
+        assert compressed.by_hashsum == "6" * 64
+        assert compressed.by_hash_path == ("multiverse/cnf/by-hash/SHA256/" + "6" * 64)
+
+    def test_uncompressed_entry_without_compressed_sibling_stays_canonical(
+        self, am, tmp_path
+    ) -> None:
+        """A Release that lists the uncompressed name and NOTHING else keeps
+        fetching it canonically (fixture repos do serve such files — e.g. the
+        tiny insecure-repo Packages)."""
+        text = (
+            "Origin: Test\n"
+            "Suite: stable\n"
+            "Components: main\n"
+            "Architectures: amd64 all\n"
+            "Acquire-By-Hash: no\n"
+            "SHA256:\n"
+            f"  {'5' * 64} 1000 main/binary-all/Packages\n"
+        )
+        path = write_release(tmp_path, text)
+        info = am.parse_release(path)
+        spec = binary_spec(am, components=["main"])
+        urls = am.index_urls_for(spec, info)
+        assert len(urls) == 1
+        assert urls[0].filename == "main/binary-all/Packages"
+        assert urls[0].by_hash is None
+        assert urls[0].by_hashsum is None
 
 
 class TestByHashPath:

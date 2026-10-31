@@ -228,6 +228,37 @@ def _index_patterns(spec: Repo) -> list[re.Pattern[str]]:
     return [re.compile(pattern) for pattern in patterns]
 
 
+def _resolve_index(
+    filename: str, entries: dict[str, list[HashEntry]]
+) -> tuple[str, list[HashEntry]]:
+    """The Release entry whose content an index download must fetch.
+
+    Returns ``(filename, entries)`` unchanged when the entry names a
+    compressed index, or when the Release lists no compressed sibling of
+    it.  An entry that names an UNCOMPRESSED index (no ``.gz`` / ``.bz2`` /
+    ``.xz`` / ``.lzma`` suffix) resolves to the compressed sibling the
+    Release also lists (``<name>.gz`` / ``.xz`` / ..., first present) — real
+    mirrors publish indexes compressed only while the Release files still
+    carry the bare spelling (Ubuntu noble lists both
+    ``multiverse/binary-amd64/Packages`` and
+    ``multiverse/binary-amd64/Packages.gz`` under their own hash sections,
+    for instance), so the bare canonical URL then answers HTTP 404 even
+    though the Release listed it.  A Release that lists no compressed
+    sibling keeps the entry as-is, which is what bare (uncompressed) Release
+    / source-Release files need — those are published uncompressed and are
+    never published compressed.
+    """
+    if _has_compression_suffix(filename):
+        return filename, entries[filename]
+    for extension in KNOWN_EXTENSIONS:
+        if extension == "":
+            continue
+        sibling = filename + extension
+        if sibling in entries:
+            return sibling, entries[sibling]
+    return filename, entries[filename]
+
+
 def _strongest_advertised(entries: list[HashEntry]) -> HashEntry | None:
     """The entry under the strongest hash section the file itself advertises.
 
@@ -258,20 +289,27 @@ def index_urls_for(spec: Repo, info: ReleaseInfo) -> list[IndexUrl]:
     sections we do not support (e.g. SHA384) likewise falls back to canonical,
     but raises a warning naming the file (spec §5.6.3).  An entry that names
     no compressed index (no ``.gz``/``.bz2``/``.xz``/``.lzma`` suffix) is
-    fetched canonically as well: mirrors answer by-hash lookups of
-    uncompressed files with 404, so the by-hash spelling is only built for
-    compressed entries.
+    resolved by `_resolve_index`: to its compressed sibling when the Release
+    lists one (mirrors publish indexes compressed only, so the bare
+    canonical URL answers 404), else fetched canonically — mirrors answer
+    by-hash lookups of uncompressed files with 404, so the by-hash spelling
+    is only built for compressed entries.
     """
     patterns = _index_patterns(spec)
     urls: list[IndexUrl] = []
     seen: set[tuple[str, str | None]] = set()
-    for filename, entries in info.entries.items():
+    for filename in info.entries:
         if not any(pattern.fullmatch(filename) for pattern in patterns):
             continue
-        strongest = _strongest_advertised(entries)
-        if info.by_hash and strongest is not None and _has_compression_suffix(filename):
+        fetch_filename, fetch_entries = _resolve_index(filename, info.entries)
+        strongest = _strongest_advertised(fetch_entries)
+        if (
+            info.by_hash
+            and strongest is not None
+            and _has_compression_suffix(fetch_filename)
+        ):
             url = IndexUrl(
-                filename=filename,
+                filename=fetch_filename,
                 size=strongest.size,
                 by_hash=strongest.hashname,
                 by_hashsum=strongest.hashsum,
@@ -281,10 +319,10 @@ def index_urls_for(spec: Repo, info: ReleaseInfo) -> list[IndexUrl]:
                 logger.warning(
                     "apt-mirror: no supported hash (SHA512/SHA256/SHA1/MD5Sum)"
                     " for %s; falling back to its canonical location",
-                    filename,
+                    fetch_filename,
                 )
             url = IndexUrl(
-                filename=filename,
+                filename=fetch_filename,
                 size=strongest.size if strongest is not None else 0,
                 by_hash=None,
                 by_hashsum=None,
