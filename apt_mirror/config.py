@@ -22,7 +22,7 @@ _MACHINE_TO_ARCH: dict[str, str] = {
     "aarch64": "arm64",
     "arm64": "arm64",
     "armv7l": "armhf",
-    "ppc64le": "powerpc64el",
+    "ppc64le": "ppc64el",
     "s390x": "s390x",
 }
 

@@ -22,7 +22,7 @@
 - Hash strength order: `SHA512 > SHA256 > SHA1 > MD5Sum` (§5.6.3).
 - Retries: 5 attempts on connection errors, timeouts, HTTP 429/5xx with exponential backoff; ~30s socket timeout. One failed URL never aborts a stage (§5.3).
 - Existing `mirror.list` format compatibility is a hard requirement — the repo's own `mirror.list` must parse (spec §3).
-- `defaultarch` auto-detection order: `dpkg --print-architecture` → `platform.machine()` mapping (`x86_64`→`amd64`, `i686`→`i386`, `aarch64`/`arm64`→`arm64`, `armv7l`→`armhf`, `ppc64le`→`powerpc64el`, `s390x`→`s390x`) → `amd64` (§5.1).
+- `defaultarch` auto-detection order: `dpkg --print-architecture` → `platform.machine()` mapping (`x86_64`→`amd64`, `i686`→`i386`, `aarch64`/`arm64`→`arm64`, `armv7l`→`armhf`, `ppc64le`→`ppc64el`, `s390x`→`s390x`) → `amd64` (§5.1).
 
 ## Review Focus
 

@@ -112,7 +112,7 @@ The Perl `apt-mirror` file and `mirror.list` stay in the repo as reference.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `defaultarch` | `dpkg --print-architecture`, else `platform.machine()` mapping (`x86_64`→`amd64`, `i686`→`i386`, `aarch64`/`arm64`→`arm64`, `armv7l`→`armhf`, `ppc64le`→`powerpc64el`, `s390x`→`s390x`), else `amd64` | Architecture for bare `deb` lines |
+| `defaultarch` | `dpkg --print-architecture`, else `platform.machine()` mapping (`x86_64`→`amd64`, `i686`→`i386`, `aarch64`/`arm64`→`arm64`, `armv7l`→`armhf`, `ppc64le`→`ppc64el`, `s390x`→`s390x`), else `amd64` | Architecture for bare `deb` lines |
 | `nthreads` | `20` | Concurrent fetch threads per stage |
 | `base_path` | `/var/spool/apt-mirror` | Root; `mirror_path`, `skel_path`, `var_path` default under it |
 | `mirror_path` | `$base_path/mirror` | Where the published mirror tree lives |

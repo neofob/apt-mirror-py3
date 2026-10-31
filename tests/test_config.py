@@ -1,5 +1,7 @@
 """Unit tests for apt-mirror config parsing and validation (Task 1)."""
 
+import platform
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -267,6 +269,19 @@ class TestGetVar:
 
 def test_detect_defaultarch_returns_nonempty_string(am) -> None:
     assert am.detect_defaultarch()
+
+
+def test_detect_defaultarch_maps_ppc64le_to_ppc64el(am, monkeypatch) -> None:
+    """Hardware ``ppc64le`` (64-bit little-endian PowerPC) resolves to the
+    Debian architecture ``ppc64el`` — ``powerpc64le`` is only the GNU
+    compiler triplet, not a Debian architecture name."""
+    monkeypatch.setattr(platform, "machine", lambda: "ppc64le")
+
+    def _no_dpkg(*args: object, **kwargs: object) -> object:
+        raise OSError("dpkg unavailable")
+
+    monkeypatch.setattr(subprocess, "run", _no_dpkg)
+    assert am.detect_defaultarch() == "ppc64el"
 
 
 def test_repo_mirror_list_parses(am) -> None:
