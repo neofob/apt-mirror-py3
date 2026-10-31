@@ -187,3 +187,38 @@ class TestSwapHonoursVariables:
         )
         parsed = am.parse_config(config)
         assert parsed.clean == {"mirror.example.com/deb~ian"}
+
+    @pytest.mark.parametrize(
+        ("value", "encode"),
+        [
+            ("2", False),
+            ("no", False),
+            ("off", False),
+            ("00", False),
+            ("0", False),
+            ("on", True),
+            ("yes", True),
+            ("1", True),
+        ],
+    )
+    def test_encoding_matches_runtime_truthiness(
+        self, am, tmp_path, value, encode
+    ) -> None:
+        """The parse-time `_tilde`/`_plus` decision for clean/skip-clean URIs
+        must use the same truthiness as the runtime `_config_on` (the
+        predicate every other stage uses, per config.py: "1"/"on"/"yes"/
+        "true" on, everything else off), so the skip-clean keys always
+        match the tree paths computed during a run.  Values the runtime
+        treats as off (e.g. `2`, `no`, `off`) must not be encoded."""
+        config = tmp_path / "mirror.list"
+        config.write_text(
+            f"set _tilde {value}\nset _plus {value}\n"
+            "clean http://mirror.example.com/deb~ian+\n"
+            "skip-clean http://skip.example.com/pkg~core\n",
+            encoding="utf-8",
+        )
+        parsed = am.parse_config(config)
+        expected_tilde = "deb%7Eian%2B" if encode else "deb~ian+"
+        expected_plus = "pkg%7Ecore" if encode else "pkg~core"
+        assert parsed.clean == {f"mirror.example.com/{expected_tilde}"}
+        assert parsed.skipclean == {f"skip.example.com/{expected_plus}"}

@@ -371,11 +371,15 @@ def parse_config(path: str | Path) -> ParsedConfig:
                 sources.append(repo)
         else:  # clean / skip-clean
             target = clean if line_type == "clean" else skipclean
+            # The encoding must use the same truthiness as every runtime
+            # consumer of these options (AptMirror, download_stage all use
+            # _config_on), so the skip-clean keys match the tree paths a
+            # run actually produces.
             target.add(
                 sanitise_uri(
                     parsed["uri"],
-                    tilde=variables["_tilde"] not in ("", "0"),
-                    plus=variables["_plus"] not in ("", "0"),
+                    tilde=_config_on(variables["_tilde"]),
+                    plus=_config_on(variables["_plus"]),
                 )
             )
     return ParsedConfig(
