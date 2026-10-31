@@ -209,7 +209,7 @@ pytest -q
 
 ## Definition of done (any change)
 
-1. `pytest -q` passes locally.
+1. `python3 -m pytest -q` passes locally.
 2. `ruff format --check apt-mirror.py apt_mirror/ tests/` and
    `ruff check apt-mirror.py apt_mirror/ tests/` pass.
 3. No new third-party runtime dependencies (the `apt_mirror/` package is
