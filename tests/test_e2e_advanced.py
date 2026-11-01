@@ -24,6 +24,11 @@ the coverage laid down in spec §5.5-5.11 and §7.1:
 15. a non-UTF-8 config file is a clean, named error (no traceback)
 16. secondary by-hash paths are hardlinked for multi-hash-listed files
     (spec §5.6.3 hash-variant dedupe)
+17. ``_plus``/``_tilde``-encoded archive paths: the tree-facing
+    bookkeeping (var/ALL, var/NEW, skip-clean) uses the same percent
+    encoding as the on-disk tree, so cleanup never removes a just-
+    mirrored archive and reruns do not re-download it (original
+    ``remove_double_slashes`` parity, spec §5.4/§5.6.4)
 
 Every server is on 127.0.0.1 only: no external network.
 """
@@ -40,6 +45,10 @@ from .conftest import (
     AUTH_USER,
     FixtureServer,
     LocalProxy,
+    _deb_block,
+    _gzip_bytes,
+    _release_text,
+    _write,
     build_fixture_repo,
     build_flat_repo,
     run_mirror,
@@ -901,3 +910,68 @@ def test_secondary_by_hash_paths_are_hardlinked(tmp_path: Path) -> None:
             assert path.stat().st_ino == anchor.stat().st_ino, name
     finally:
         _close(urls)
+
+
+def test_plus_tilde_encoded_archive_paths_survive_cleanup_and_reruns(
+    tmp_path: Path,
+) -> None:
+    """Scenario 17 (regression, spec §5.4/§5.6.4): with ``set _plus 1`` /
+    ``set _tilde 1`` and an index ``Filename:`` carrying a literal ``+``
+    and ``~`` (legal in a Debian pool path), the archive lands on disk
+    under its percent-encoded (``%2B``/``%7E``) spelling; the var/ALL,
+    var/NEW and skip-clean registrations must carry that same encoded
+    spelling (the original's ``remove_double_slashes`` always applied the
+    encodings to tree-facing paths).  With unencoded bookkeeping the
+    clean stage treats the just-mirrored archive as unneeded — under
+    ``_autoclean 1`` it is deleted inside the very run that downloaded it
+    — and ``need_update`` stats the unencoded path, so every rerun
+    re-downloads it."""
+    root = tmp_path / "fixture"
+    base = root / "repo"
+    dist = base / "dists" / "dist"
+    pkg = b"FAKEARCHIVE encoded 4100\n" + b"z" * 3900
+    pool_rel = "pool/main/f/foo+bar/foo+bar_1.0~b1-1_amd64.deb"
+    _write(base / pool_rel, pkg)
+    gz = _gzip_bytes(
+        _deb_block("foo+bar", "1.0~b1-1", "amd64", pool_rel, pkg).encode("ascii")
+    )
+    _write(dist / "main" / "binary-amd64" / "Packages.gz", gz)
+    _write(
+        dist / "Release",
+        _release_text(
+            "dist", "main", {"main/binary-amd64/Packages.gz": gz}, False
+        ).encode("ascii"),
+    )
+    server = FixtureServer()
+    server.__enter__()
+    try:
+        serve_subtree(server, root, "repo")
+        base_url = f"http://127.0.0.1:{server.port}/repo"
+        spool = tmp_path / "spool"
+        host = f"127.0.0.1:{server.port}"
+        encoded_rel = pool_rel.replace("+", "%2B").replace("~", "%7E")
+        target = spool / "mirror" / host / "repo" / encoded_rel
+        extra = ["set _plus 1", "set _tilde 1"]
+
+        # Pass 1: _autoclean 1 — the freshly mirrored archive must
+        # survive the run's own clean stage.
+        config = write_config(spool, {"dist": base_url}, autoclean="1", extra=extra)
+        result = run_mirror(config)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert target.is_file(), "autoclean removed the just-mirrored archive"
+        # The tree-facing bookkeeping carries the encoded spelling.
+        new_lines = (spool / "var" / "NEW").read_text().splitlines()
+        assert f"http://{host}/repo/{encoded_rel}" in new_lines
+        assert f"{host}/repo/{encoded_rel}" in (spool / "var" / "ALL").read_text()
+
+        # Pass 2: _autoclean 0 — nothing is re-downloaded (empty NEW) and
+        # the generated clean script must not name the live archive.
+        config = write_config(spool, {"dist": base_url}, autoclean="0", extra=extra)
+        result = run_mirror(config)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert target.is_file()
+        assert (spool / "var" / "NEW").read_text() == ""
+        clean_sh = (spool / "var" / "clean.sh").read_text(encoding="utf-8")
+        assert encoded_rel not in clean_sh
+    finally:
+        server.__exit__(None, None, None)

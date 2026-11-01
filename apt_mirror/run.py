@@ -39,10 +39,16 @@ class ArchiveBookkeeping:
     """Accumulates the var/ALL, NEW, MD5, SHA1, SHA256 line lists and the
     archive download queue while archive indexes are parsed."""
 
-    def __init__(self, mirror_path: Path) -> None:
+    def __init__(
+        self, mirror_path: Path, tilde: bool = False, plus: bool = False
+    ) -> None:
         """Start every line list and the urls queue empty; keep
-        ``mirror_path`` for the per-record need_update checks."""
+        ``mirror_path`` for the per-record need_update checks and the
+        ``_tilde`` / ``_plus`` encodings that every tree-facing path
+        carries (see tree_rel)."""
         self.mirror_path = mirror_path
+        self.tilde = tilde
+        self.plus = plus
         self.all_lines: list[str] = []
         self.new_lines: list[str] = []
         self.md5_lines: list[str] = []
@@ -50,25 +56,41 @@ class ArchiveBookkeeping:
         self.sha256_lines: list[str] = []
         self._urls: dict[str, int] = {}
 
+    def tree_rel(self, rec: PackageRec) -> str:
+        """``rec.mirror_rel`` as laid out in the mirror tree: with the
+        ``_tilde`` / ``_plus`` percent-encodings (``~`` → ``%7E``,
+        ``+`` → ``%2B``) applied.  The original's ``remove_double_slashes``
+        always applied those encodings, so every tree-facing path the
+        bookkeeping registers (var/ALL, MD5/SHA1/SHA256, the skip-clean
+        set and the need_update stat) must use this spelling — the
+        files themselves land under sanitise_uri(url, _tilde, _plus)."""
+        return remove_double_slashes(rec.mirror_rel, self.tilde, self.plus)
+
     def add(self, spec: Repo, rec: PackageRec) -> None:
-        """One PackageRec added once: mirror_rel → all lines; md5/sha1/
-        sha256 records; and, when need_update(mirror_path/mirror_rel,
-        size) is true, the credential-stripped NEW line plus the full
-        (userinfo-carrying) URL → size in urls (spec §7.1 fix #2)."""
-        self.all_lines.append(rec.mirror_rel)
+        """One PackageRec added once: tree_rel → all lines; md5/sha1/
+        sha256 records; and, when need_update(mirror_path/tree_rel,
+        size) is true, the credential-stripped, percent-encoded NEW line
+        plus the full (userinfo-carrying, unencoded) URL → size in urls
+        (spec §7.1 fix #2)."""
+        rel = self.tree_rel(rec)
+        self.all_lines.append(rel)
         if rec.md5 is not None:
-            self.md5_lines.append(f"{rec.md5}  {rec.mirror_rel}")
+            self.md5_lines.append(f"{rec.md5}  {rel}")
         if rec.sha1 is not None:
-            self.sha1_lines.append(f"{rec.sha1}  {rec.mirror_rel}")
+            self.sha1_lines.append(f"{rec.sha1}  {rel}")
         if rec.sha256 is not None:
-            self.sha256_lines.append(f"{rec.sha256}  {rec.mirror_rel}")
-        if need_update(self.mirror_path / rec.mirror_rel, rec.size):
+            self.sha256_lines.append(f"{rec.sha256}  {rel}")
+        if need_update(self.mirror_path / rel, rec.size):
             # Full (possibly userinfo-carrying) URL for the
-            # download queue; var/NEW is a persisted file and
-            # must carry the credential-stripped form only
-            # (spec §7.1 fix #2).
+            # download queue, kept unencoded (the server path); var/NEW
+            # is a persisted file and must carry the credential-stripped
+            # tree spelling only (spec §7.1 fix #2).
             download_url = remove_double_slashes(f"{spec.uri}/{rec.url_rel}")
-            self.new_lines.append(_strip_userinfo(download_url))
+            self.new_lines.append(
+                _strip_userinfo(
+                    remove_double_slashes(download_url, self.tilde, self.plus)
+                )
+            )
             self._urls[download_url] = rec.size
 
     def write_var_files(self, var_path: Path) -> None:
@@ -115,7 +137,7 @@ class AptMirror:
         self.skel_path = Path(get_var(self.variables, "skel_path"))
         self.var_path = Path(get_var(self.variables, "var_path"))
         self.cleanscript_path = Path(get_var(self.variables, "cleanscript"))
-        self.archives = ArchiveBookkeeping(self.mirror_path)
+        self.archives = ArchiveBookkeeping(self.mirror_path, self.tilde, self.plus)
 
         # Shared per-run state.  skipclean starts with the config skip-clean
         # entries and gains every queued file (canonical **and** by-hash tree
@@ -373,8 +395,8 @@ class AptMirror:
             for rec in self._read_index(spec, path, f"{spec.uri}/{rel}", tree_prefix):
                 # One source of truth per record: every bookkeeping
                 # list and the skipclean set see the very same
-                # PackageRec.
-                self.skipclean.add(rec.mirror_rel)
+                # (percent-encoded) tree path of the PackageRec.
+                self.skipclean.add(self.archives.tree_rel(rec))
                 self.archives.add(spec, rec)
             return
         if not optional:
